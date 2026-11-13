@@ -82,6 +82,8 @@ except NameError:
 
 
 def update_curve(curve, start, end):
+    if not curve or len(curve.keyframe_points) < 2:
+        return
     coords = [
         (1.0, start),
         (250.0, end),
@@ -98,28 +100,80 @@ wand_object = bpy.data.objects["Wand"]
 wand_object.location = (params["start_x"], params["start_y"], params["start_z"])
 
 # Modify the Start and End keyframes
-action = bpy.data.actions["CubeAction"]
-update_curve(action.fcurves[0], params["start_x"], params["end_x"])
-update_curve(action.fcurves[1], params["start_y"], params["end_y"])
-update_curve(action.fcurves[2], params["start_z"], params["end_z"])
+action = bpy.data.actions.get("CubeAction")
+if action:
+    try:
+        fcurves = list(get_action_fcurves(action))
+    except Exception:
+        fcurves = list(getattr(action, "fcurves", []))
+
+    by_index = {fc.array_index: fc for fc in fcurves}
+    fc_x = by_index.get(0) if by_index else (fcurves[0] if len(fcurves) > 0 else None)
+    fc_y = by_index.get(1) if by_index else (fcurves[1] if len(fcurves) > 1 else None)
+    fc_z = by_index.get(2) if by_index else (fcurves[2] if len(fcurves) > 2 else None)
+
+    update_curve(fc_x, params["start_x"], params["end_x"])
+    update_curve(fc_y, params["start_y"], params["end_y"])
+    update_curve(fc_z, params["start_z"], params["end_z"])
 
 # Change the material settings (color, alpha, etc...)
-material_object = bpy.data.materials["Material"]
-mat_emission = material_object.node_tree.nodes["Emission"]
-mat_emission.inputs[0].default_value = params["diffuse_color"]
-mat_emission.inputs[1].default_value = params["strength"]
-material_object.diffuse_color = params["diffuse_color"]
+set_material_color("Material", params["diffuse_color"], emission_strength=params["strength"])
 
 # Change size of particle
 sval = params["particle_scale"]
 bpy.data.objects["Sphere"].scale = (sval, sval, sval)
 
-# Change glare type
-bpy.data.scenes["Scene"].node_tree.nodes["Glare"].glare_type = params["glare_type"]
+# Change glare settings (handle missing scene.node_tree like Blender 5)
+def _apply_glare(node_tree):
+    """Assign glare_type or equivalent input on any GLARE compositor node (recursing into groups)."""
+    if not node_tree:
+        return False
+    updated = False
+    glare_input_map = {
+        "STREAKS": "Streaks",
+        "GHOSTS": "Ghosts",
+        "SIMPLE_STAR": "Simple Star",
+        "SUN_BEAMS": "Sun Beams",
+    }
+    glare_input_value = glare_input_map.get(params["glare_type"], "Ghosts")
+    glare_color = params.get("diffuse_color")
+    glare_strength = params.get("strength")
+    for node in node_tree.nodes:
+        if node.type == 'GLARE':
+            if hasattr(node, "glare_type"):
+                node.glare_type = params["glare_type"]
+                updated = True
+            elif hasattr(node, "inputs") and len(node.inputs) > 1:
+                try:
+                    node.inputs[1].default_value = glare_input_value
+                    updated = True
+                except Exception:
+                    pass
+            # Optional tint/strength if sockets exist
+            if hasattr(node, "inputs"):
+                if glare_color is not None and len(node.inputs) > 9:
+                    try:
+                        node.inputs[9].default_value = glare_color
+                    except Exception:
+                        pass
+                if glare_strength is not None and len(node.inputs) > 2:
+                    try:
+                        node.inputs[2].default_value = glare_strength
+                    except Exception:
+                        pass
+        elif node.type == 'GROUP' and getattr(node, "node_tree", None):
+            updated = _apply_glare(node.node_tree) or updated
+    return updated
+
+scene_tree = getattr(bpy.context.scene, "node_tree", None)
+if not _apply_glare(scene_tree):
+    comp_group = bpy.data.node_groups.get("Compositing Nodetree")
+    if comp_group:
+        _apply_glare(comp_group)
 
 # Change particle settings
 psettings = bpy.data.particles["ParticleSettings"]
-psettings.count = params["particles_count"]
+psettings.count = int(params["particles_count"])
 psettings.lifetime = params["particles_lifetime"]
 psettings.effector_weights.gravity = params["particles_gravity"]
 psettings.object_align_factor = (
@@ -146,8 +200,8 @@ bpy.data.worlds["World"].color = params["horizon_color"]
 bpy.ops.ptcache.free_bake_all()
 
 # Animation Speed (use Blender's time remapping to slow or speed up animation)
-length_multiplier = int(params["length_multiplier"])  # time remapping multiplier
-new_length = int(params["end_frame"]) * length_multiplier  # new length (in frames)
+length_multiplier = round(params["length_multiplier"])  # time remapping multiplier
+new_length = params["end_frame"] * length_multiplier  # new length (in frames)
 render.frame_map_old = 1
 render.frame_map_new = length_multiplier
 

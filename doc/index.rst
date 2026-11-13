@@ -1,4 +1,4 @@
-.. Copyright (c) 2008-2016 OpenShot Studios, LLC
+.. Copyright (c) 2008-2026 OpenShot Studios, LLC
  (http://www.openshotstudios.com). This file is part of
  OpenShot Video Editor (http://www.openshot.org), an open-source project
  dedicated to delivering high quality video editing and animation solutions
@@ -20,12 +20,11 @@
 OpenShot User Guide
 ===================
 
-OpenShot Video Editor is an award-winning, open-source video editor, available on
-Linux, Mac, and Windows. OpenShot can create stunning videos, films, and animations with an
+OpenShot Video Editor is a free, award-winning, open-source video editor, available on
+Linux, Mac, Chrome OS, and Windows. OpenShot can create stunning videos, films, and animations with an
 easy-to-use interface and rich set of features.
 
-Learning to use OpenShot is easy, and with this guide, you will be a master in no
-time at all!
+.. image:: images/ui-example.jpg
 
 Table of Contents:
 ------------------
@@ -36,14 +35,27 @@ Table of Contents:
    introduction
    installation
    quick_tutorial
+   getting_started
    main_window
+   keyboard
+   timeline
+   recording
    files
    clips
    transitions
+   effects
+   color
+   export
    animation
    titles
    profiles
    import_export
+   preferences
+   playback
+   ai
+   troubleshoot
+   agent_cli
    developers
    contributing
    learn_more
+   glossary

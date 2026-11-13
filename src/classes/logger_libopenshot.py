@@ -1,6 +1,6 @@
 """
  @file
- @brief This file connects to libopenshot and logs debug messages (if debug preference enabled)
+ @brief Configure independent Python and libopenshot log files
  @author Jonathan Thomas <jonathan@openshot.org>
 
  @section LICENSE
@@ -25,60 +25,39 @@
  along with OpenShot Library.  If not, see <http://www.gnu.org/licenses/>.
  """
 
-from threading import Thread
-from classes import settings, info
-from classes.logger import log
-import openshot
 import os
-import zmq
+import openshot
+from classes import info, log_config
+from classes.logger import log, set_level_file, set_level_console
 
 
-class LoggerLibOpenShot(Thread):
-    def __init__(self):
-        super().__init__()
-        self.daemon = True
+def configure(debug=False, initialize=False, ui_debug=False):
+    """Configure independent Python/native sinks. No forwarding thread is needed."""
+    logger_type = getattr(openshot, "Logger", None)
+    native = logger_type.Instance() if logger_type is not None else None
+    if initialize and native is None:
+        log.warning("Installed libopenshot lacks the Logger API; native logging controls "
+                    "are unavailable. Update libopenshot and its Python bindings.")
+    if initialize and native is not None:
+        # The GUI owns the destination; standalone users can use LIBOPENSHOT_LOG_FILE.
+        native.Path(os.path.join(info.USER_PATH, "libopenshot.log"))
+    for component in ("python", "native"):
+        if component == "native" and native is None:
+            continue
+        for destination in ("file", "console"):
+            value, source = log_config.resolve(
+                component, destination, ui_debug if component == "python" else debug)
+            if component == "python":
+                setter = set_level_file if destination == "file" else set_level_console
+                setter(log_config.LEVELS[value])
+            elif destination == "file":
+                native.SetFileLevel(value)
+            else:
+                native.SetConsoleLevel(value)
+            log.debug("Logging %s %s: %s (%s)", component, destination, value, source)
 
-    def kill(self):
-        self.running = False
 
-    def run(self):
-        # Running
-        self.running = True
-
-        # Get settings
-        s = settings.get_settings()
-
-        # Get port from settings
-        port = s.get("debug-port")
-        debug_enabled = s.get("debug-mode")
-
-        # Set port on ZmqLogger singleton
-        openshot.ZmqLogger.Instance().Connection("tcp://*:%s" % port)
-
-        # Set filepath for ZmqLogger also
-        openshot.ZmqLogger.Instance().Path(os.path.join(info.USER_PATH, 'libopenshot.log'))
-
-        # Enable / Disable logger
-        openshot.ZmqLogger.Instance().Enable(debug_enabled)
-
-        # Socket to talk to server
-        context = zmq.Context()
-        socket = context.socket(zmq.SUB)
-        socket.setsockopt_string(zmq.SUBSCRIBE, '')
-
-        poller = zmq.Poller()
-        poller.register(socket, zmq.POLLIN)
-
-        log.info("Connecting to libopenshot with debug port: %s" % port)
-        socket.connect ("tcp://localhost:%s" % port)
-
-        while self.running:
-            msg = None
-
-            # Receive all debug message sent from libopenshot (if any)
-            socks = dict(poller.poll(1000))
-            if socks and socks.get(socket) == zmq.POLLIN:
-                msg = socket.recv(zmq.NOBLOCK)
-
-            if msg:
-                log.info(msg.strip().decode('UTF-8'))
+def close():
+    logger_type = getattr(openshot, "Logger", None)
+    if logger_type is not None:
+        logger_type.Instance().Close()

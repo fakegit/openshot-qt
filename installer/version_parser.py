@@ -36,10 +36,11 @@ sys.path.append(os.path.join(PATH, 'src', 'classes'))
 
 def parse_version_info(version_path):
     """Parse version info from gitlab artifacts"""
-    version_info = { "date": f'{datetime.datetime.now():%Y-%m-%d %H:%M}' }
+    version_info = {"date": f'{datetime.datetime.now():%Y-%m-%d %H:%M}'}
 
     # Get name of version file
-    version_name = os.path.basename(version_path)
+    file_name = os.path.basename(version_path)
+    version_name = os.path.splitext(file_name)[0]
     version_info[version_name] = {
         "CI_PROJECT_NAME": None,
         "CI_COMMIT_REF_NAME": None,
@@ -53,9 +54,12 @@ def parse_version_info(version_path):
     if os.path.exists(version_path):
         with open(version_path, "r") as f:
             # Parse each line in f as a 'key:value' string
-            version_info[version_name].update((l.strip().split(':') for l in f.readlines()))
+            version_info[version_name].update(
+                (ln.strip().split(':') for ln in f.readlines())
+            )
 
     return version_info
+
 
 def parse_build_name(version_info, git_branch_name=""):
     """Calculate the build name used in URLs and Installers from the version_info dict"""
@@ -89,6 +93,22 @@ def parse_build_name(version_info, git_branch_name=""):
     return build_name
 
 
+def write_build_metadata(version_path, version_info, environ=None):
+    """Write provenance for this build, clearing any marker left by an earlier build.
+
+    Copying the CI configuration into a fork must not label its builds official.
+    This is a distribution label, not a cryptographic authenticity check.
+    """
+    environ = os.environ if environ is None else environ
+    metadata = dict(version_info)
+    metadata["official_distribution"] = (
+        environ.get("CI_SERVER_HOST") == "gitlab.openshot.org"
+        and environ.get("CI_PROJECT_PATH") == "OpenShot/openshot-qt"
+    )
+    with open(version_path, "w", encoding="utf-8") as stream:
+        json.dump(metadata, stream, indent=4)
+
+
 if __name__ == "__main__":
     """Run these methods manually for testing"""
     # Determine absolute PATH of OpenShot folder
@@ -99,9 +119,9 @@ if __name__ == "__main__":
 
     # Parse all version info (if found)
     for git_log_filename in os.listdir(settings_path):
-        git_log_filepath = os.path.join(settings_path, git_log_filename)
-        if os.path.splitext(git_log_filepath)[1] == "":
-            # No extension, parse version info
+        if git_log_filename.endswith(".env"):
+            # Metadata file, parse version info
+            git_log_filepath = os.path.join(settings_path, git_log_filename)
             version_info.update(parse_version_info(git_log_filepath))
 
     # Calculate build name from version info

@@ -36,23 +36,24 @@ try:
 except ImportError:
     from xml.etree import ElementTree
 
-from PyQt5.QtCore import QDir, QLocale
-from PyQt5.QtGui import QIcon
-from PyQt5.QtWidgets import QApplication, QWidget, QTabWidget, QAction
-from PyQt5 import uic
+from qt_api import Qt, QDir, QLocale
+from qt_api import QIcon, QPalette, QColor, QPainter, QPixmap
+from qt_api import (
+    QApplication, QWidget, QTabWidget, QAction)
+from qt_api import uic, load_ui as qt_load_ui
 
+from classes.app import get_app
 from classes.logger import log
-from classes import settings
 
 from . import openshot_rc  # noqa
 
 DEFAULT_THEME_NAME = "Humanity"
 
 
-def load_theme():
+def load_icon_theme():
     """ Load the current OS theme, or fallback to a default one """
 
-    s = settings.get_settings()
+    s = get_app().get_settings()
 
     # If theme not reported by OS
     if QIcon.themeName() == '' and s.get("theme") != "No Theme":
@@ -76,7 +77,10 @@ def load_ui(window, path):
     for attempt in range(1, 6):
         try:
             # Load ui from configured path
-            uic.loadUi(path, window)
+            if uic is not None and hasattr(uic, "loadUi"):
+                uic.loadUi(path, window)
+            else:
+                qt_load_ui(path, window)
 
             # Successfully loaded UI file, so clear any previously encountered errors
             error = None
@@ -95,6 +99,24 @@ def load_ui(window, path):
     window.uiTree = ElementTree.parse(path)
 
 
+def painted_icon(width, height, paint, scales=(1, 1.25, 1.5, 2, 2.5, 3, 4)):
+    """An icon drawn by paint(painter) in logical coordinates, sharp at every screen scale.
+
+    Each scale gets its own pixmap, so HiDPI screens never stretch a 1x drawing.
+    """
+    icon = QIcon()
+    for scale in scales:
+        pixmap = QPixmap(round(width * scale), round(height * scale))
+        pixmap.setDevicePixelRatio(scale)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        paint(painter)
+        painter.end()
+        icon.addPixmap(pixmap)
+    return icon
+
+
 def get_default_icon(theme_name):
     """ Get a QIcon, and fallback to default theme if OS does not support themes. """
 
@@ -102,6 +124,38 @@ def get_default_icon(theme_name):
     start_path = ":/icons/" + DEFAULT_THEME_NAME + "/"
     icon_path = search_dir(start_path, theme_name)
     return QIcon(icon_path), icon_path
+
+
+def make_dark_palette(darkPalette: QPalette) -> QPalette:
+    darkPalette.setColor(QPalette.Window, QColor(53, 53, 53))
+    darkPalette.setColor(QPalette.WindowText, Qt.white)
+    darkPalette.setColor(QPalette.Base, QColor(25, 25, 25))
+    darkPalette.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
+    darkPalette.setColor(QPalette.Light, QColor(68, 68, 68))
+    darkPalette.setColor(QPalette.Text, Qt.white)
+    darkPalette.setColor(QPalette.Button, QColor(53, 53, 53))
+    darkPalette.setColor(QPalette.ButtonText, Qt.white)
+    darkPalette.setColor(QPalette.Highlight, QColor(42, 130, 218, 192))
+    darkPalette.setColor(QPalette.HighlightedText, Qt.black)
+    #
+    # Disabled palette
+    #
+    darkPalette.setColor(QPalette.Disabled, QPalette.WindowText, QColor(255, 255, 255, 128))
+    darkPalette.setColor(QPalette.Disabled, QPalette.Base, QColor(68, 68, 68))
+    darkPalette.setColor(QPalette.Disabled, QPalette.Text, QColor(255, 255, 255, 128))
+    darkPalette.setColor(QPalette.Disabled, QPalette.Button, QColor(53, 53, 53, 128))
+    darkPalette.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(255, 255, 255, 128))
+    darkPalette.setColor(QPalette.Disabled, QPalette.Highlight, QColor(151, 151, 151, 192))
+    darkPalette.setColor(QPalette.Disabled, QPalette.HighlightedText, Qt.black)
+
+    # Tooltips
+    darkPalette.setColor(QPalette.ToolTipBase, QColor(42, 130, 218))
+    darkPalette.setColor(QPalette.ToolTipText, Qt.white)
+    # Links
+    darkPalette.setColor(QPalette.Link, QColor(85, 170, 255))
+    darkPalette.setColor(QPalette.LinkVisited, QColor(136, 85, 255))
+
+    return darkPalette
 
 
 def search_dir(base_path, theme_name):
@@ -220,10 +274,36 @@ def connect_auto_events(window, elem, name):
     if hasattr(elem, 'trigger'):
         func_name = name + "_trigger"
         if hasattr(window, func_name) and callable(getattr(window, func_name)):
+            # Disconnect existing connections safely
+            while True:
+                try:
+                    disconnected = elem.triggered.disconnect()
+                except TypeError:
+                    break  # No more connections to disconnect (PyQt)
+                except Exception:
+                    break
+                else:
+                    if disconnected is False:
+                        break  # No more connections to disconnect (PySide)
+            # Connect the signal to the slot
             elem.triggered.connect(getattr(window, func_name))
+
+    # Similar approach for clicked signal
     if hasattr(elem, 'click'):
         func_name = name + "_click"
         if hasattr(window, func_name) and callable(getattr(window, func_name)):
+            # Disconnect existing connections safely
+            while True:
+                try:
+                    disconnected = elem.clicked.disconnect()
+                except TypeError:
+                    break  # No more connections to disconnect (PyQt)
+                except Exception:
+                    break
+                else:
+                    if disconnected is False:
+                        break  # No more connections to disconnect (PySide)
+            # Connect the signal to the slot
             elem.clicked.connect(getattr(window, func_name))
 
 
@@ -247,6 +327,7 @@ def init_ui(window):
         # Loop through all actions
         for action in window.findChildren(QAction):
             init_element(window, action)
+            window.addAction(action)
     except Exception:
         log.info(
             'Failed to initialize an element on %s', window.objectName())
@@ -254,8 +335,6 @@ def init_ui(window):
 
 def center(window):
     """Center a window on the main window"""
-    from classes.app import get_app
-
     frameGm = window.frameGeometry()
     centerPoint = get_app().window.frameGeometry().center()
     frameGm.moveCenter(centerPoint)
@@ -263,4 +342,6 @@ def center(window):
 
 
 def transfer_children(from_widget, to_widget):
-    log.info("Transferring children from '{}' to '{}'".format(from_widget.objectName(), to_widget.objectName()))
+    log.info(
+        "Transferring children from '%s' to '%s'",
+        from_widget.objectName(), to_widget.objectName())

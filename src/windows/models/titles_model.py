@@ -28,9 +28,9 @@
 import os
 import fnmatch
 
-from PyQt5.QtCore import Qt, QObject, QMimeData
-from PyQt5.QtGui import QStandardItemModel, QStandardItem, QIcon
-from PyQt5.QtWidgets import QMessageBox
+from qt_api import Qt, QObject, QMimeData, QSortFilterProxyModel, QItemSelectionModel, QLocale
+from qt_api import QStandardItemModel, QStandardItem, QIcon
+from qt_api import QMessageBox
 import openshot  # Python module for libopenshot (required video editing module installed separately)
 
 from classes import info
@@ -38,6 +38,17 @@ from classes.logger import log
 from classes.app import get_app
 
 import json
+
+
+class TitleFilterProxyModel(QSortFilterProxyModel):
+    """Proxy class used for sorting and filtering model data"""
+
+    def lessThan(self, left, right):
+        """Sort titles model by a column at runtime"""
+        leftData = left.data(self.sortRole())
+        rightData = right.data(self.sortRole())
+
+        return leftData < rightData
 
 
 class TitleStandardItemModel(QStandardItemModel):
@@ -114,7 +125,7 @@ class TitlesModel(QObject):
             # replace suffix number with placeholder (if any)
             if suffix_number:
                 title_name = title_name.replace(suffix_number, "%s")
-                title_name = self.app._tr(title_name) % suffix_number
+                title_name = self.app._tr(title_name) % QLocale().toString(int(suffix_number))
             else:
                 title_name = self.app._tr(title_name)
 
@@ -145,9 +156,14 @@ class TitlesModel(QObject):
                     msg.setText(_("%s is not a valid image file." % filename))
                     msg.exec_()
                     continue
+
+            # Load icon (using display DPI)
+            icon = QIcon()
+            icon.addFile(thumb_path)
+
             # Create item entry for model
             flags = Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsUserCheckable | Qt.ItemIsDragEnabled
-            item = QStandardItem(QIcon(thumb_path), title_name)
+            item = QStandardItem(icon, title_name)
             item.setData(path, TitleRoles.PathRole)
             item.setToolTip(title_name)
             item.setFlags(flags)
@@ -168,12 +184,24 @@ class TitlesModel(QObject):
         self.model.setColumnCount(1)
         self.model_paths = {}
 
+        # Create proxy model (for sorting and filtering)
+        self.proxy_model = TitleFilterProxyModel()
+        self.proxy_model.setDynamicSortFilter(True)
+        self.proxy_model.setFilterCaseSensitivity(Qt.CaseInsensitive)
+        self.proxy_model.setFilterKeyColumn(1)
+        self.proxy_model.setSortCaseSensitivity(Qt.CaseSensitive)
+        self.proxy_model.setSourceModel(self.model)
+        self.proxy_model.setSortLocaleAware(True)
+
+        # Create selection model to share between views
+        self.selection_model = QItemSelectionModel(self.proxy_model)
+
         # Attempt to load model testing interface, if requested
         # (will only succeed with Qt 5.11+)
         if info.MODEL_TEST:
             try:
                 # Create model tester objects
-                from PyQt5.QtTest import QAbstractItemModelTester
+                from qt_api import QAbstractItemModelTester
                 QAbstractItemModelTester(
                     self.model, QAbstractItemModelTester.FailureReportingMode.Warning)
                 log.info("Enabled model tests for title editor data")

@@ -39,8 +39,14 @@ from classes import info
 from classes.app import get_app
 
 # Compiled path regex
-path_regex = re.compile(r'"(image|path)"\s*:\s*"(.*?)"')
+path_regex = re.compile(r'"(image|path|resource|protobuf_data_path|lut_path)"\s*:\s*"(.*?)"')
 path_context = {}
+
+# Determine regex pattern type (compatible with older Python versions)
+try:
+    _REGEX_TYPE = re.Pattern
+except AttributeError:
+    _REGEX_TYPE = type(re.compile(""))
 
 
 class JsonDataStore:
@@ -54,26 +60,30 @@ class JsonDataStore:
         self._data = {}  # Private data store, accessible through the get and set methods
         self.data_type = "json data"
 
-        # Regular expression for project files with possible corruption
-        self.version_re = re.compile(r'"openshot-qt".*"2.5.0')
+        # Regular expressions for file version detection of possible corruption
+        self.version_re_250 = re.compile(r'"openshot-qt".*"2.5.0')
+        self.version_re_260 = re.compile(r'"openshot-qt".*"2.6.0')
 
         # Regular expression matching likely corruption in project files
         self.damage_re = re.compile(r'/u([0-9a-fA-F]{4})')
 
+        # Regular expression matching likely windows drive letter corruption in project files
+        self.damage_re_windows_drives = re.compile(r'(\n\s*)(\w*):')
+
         # Regular expression used to detect lost slashes, when repairing data
         self.slash_repair_re = re.compile(r'(["/][.]+)(/u[0-9a-fA-F]{4})')
 
-        # Connection to Qt main window, used in recovery alerts
-        app = get_app()
-        if app:
-            self.app = app
-
-        if app and app._tr:
-            self._ = app._tr
-        else:
-            def fn(arg):
-                return arg
-            self._ = fn
+    def __deepcopy__(self, memo):
+        """Custom deepcopy to handle regex objects on older Python versions."""
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+        for key, value in self.__dict__.items():
+            if isinstance(value, _REGEX_TYPE):
+                setattr(result, key, value)
+            else:
+                setattr(result, key, copy.deepcopy(value, memo))
+        return result
 
     def get(self, key):
         """ Get copied value of a given key in data store """
@@ -89,10 +99,10 @@ class JsonDataStore:
                     user_values[item["setting"].lower()] = item["value"]
 
             # Settings data
-            return copy.deepcopy(user_values.get(key, None))
+            return json.loads(json.dumps(user_values.get(key, None)))
         else:
             # Project data (i.e dictionary)
-            return copy.deepcopy(self._data.get(key, None))
+            return json.loads(json.dumps(self._data.get(key, None)))
 
     def set(self, key, value):
         """ Store value in key """
@@ -148,14 +158,29 @@ class JsonDataStore:
 
     def read_from_file(self, file_path, path_mode="ignore"):
         """ Load JSON settings from a file """
+        from qt_api import read_file_text, write_file_text, is_content_uri
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                contents = f.read()
+            contents = read_file_text(file_path)
             if not contents:
                 raise RuntimeError("Couldn't load {} file, no data.".format(self.data_type))
 
+            # Scan for and correct possible OpenShot 2.6.0 corruption
+            if self.damage_re_windows_drives.search(contents) and self.version_re_260.search(contents):
+                # File contains corruptions, backup and repair
+                self.make_repair_backup(file_path, contents)
+
+                # Repair lost quotes
+                contents = self.damage_re_windows_drives.sub(r'\1"\2":', contents)
+
+                # We have to de- and re-serialize the data, to complete repairs
+                temp_data = json.loads(contents)
+                contents = json.dumps(temp_data, ensure_ascii=False, indent=1)
+
+                write_file_text(file_path, contents)
+                log.info("Repaired windows drive corruptions in file {}".format(file_path))
+
             # Scan for and correct possible OpenShot 2.5.0 corruption
-            if self.damage_re.search(contents) and self.version_re.search(contents):
+            if self.damage_re.search(contents) and self.version_re_250.search(contents):
                 # File contains corruptions, backup and repair
                 self.make_repair_backup(file_path, contents)
 
@@ -164,29 +189,17 @@ class JsonDataStore:
                 contents, subs_count = self.damage_re.subn(r'\\u\1', contents)
 
                 if subs_count < 1:
-                    # Nothing to do!
                     log.info("No recovery substitutions on {}".format(file_path))
                 else:
                     # We have to de- and re-serialize the data, to complete repairs
                     temp_data = json.loads(contents)
                     contents = json.dumps(temp_data, ensure_ascii=False, indent=1)
-                    temp_data = {}
 
-                    # Save the repaired data back to the original file
-                    with open(file_path, "w", encoding="utf-8") as fout:
-                        fout.write(contents)
+                    write_file_text(file_path, contents)
+                    log.info("Repaired {} corruptions in file {}".format(subs_count, file_path))
 
-                    msg_log = "Repaired {} corruptions in file {}"
-                    msg_local = self._("Repaired {num} corruptions in file {path}")
-                    log.info(msg_log.format(subs_count, file_path))
-                    if hasattr(self.app, "window") and hasattr(self.app.window, "statusBar"):
-                        self.app.window.statusBar.showMessage(
-                            msg_local.format(num=subs_count, path=file_path), 5000
-                        )
-
-            # Process JSON data
-            if path_mode == "absolute":
-                # Convert any paths to absolute
+            # Path conversion is only meaningful for local filesystem paths.
+            if path_mode == "absolute" and not is_content_uri(file_path):
                 contents = self.convert_paths_to_absolute(file_path, contents)
             return json.loads(contents)
         except RuntimeError as ex:
@@ -196,32 +209,46 @@ class JsonDataStore:
             msg = "Couldn't load {} file".format(self.data_type)
             log.error(msg, exc_info=1)
             raise Exception(msg) from ex
-        msg = ()
-        log.warning(msg)
-        raise Exception(msg)
+        raise Exception("Unknown error (should be unreachable)")
 
     def write_to_file(self, file_path, data, path_mode="ignore", previous_path=None):
         """ Save JSON settings to a file """
+        from qt_api import write_file_chunks, is_content_uri
         try:
-            contents = json.dumps(data, ensure_ascii=False, indent=1)
-            if path_mode == "relative":
-                # Convert any paths to relative
-                contents = self.convert_paths_to_relative(file_path, previous_path, contents)
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(contents)
+            chunks = json.JSONEncoder(ensure_ascii=False, indent=1).iterencode(data)
+            # Path conversion is only meaningful for local filesystem paths.
+            if path_mode == "relative" and not is_content_uri(file_path):
+                contents = self.convert_paths_to_relative(file_path, previous_path, "".join(chunks))
+                chunks = (contents,)
+            write_file_chunks(file_path, chunks)
         except Exception as ex:
             msg = "Couldn't save {} file:\n{}\n{}".format(self.data_type, file_path, ex)
             log.error(msg)
-            raise Exception(msg)
+            raise ex
 
     def replace_string_to_absolute(self, match):
         """Replace matched string for converting paths to relative paths"""
         key = match.groups(0)[0]
         path = match.groups(0)[1]
 
+        # Convert escaped path back into python str.
+        # Some characters, such as backslashes and quotes
+        # are escaped during the JSON dumps() conversion.
+        #   /Videos/quote \\"/  instead of  /Videos/quote "/
+        path = json.loads('"%s"' % path)
+
+        if path == "":
+            return '"%s": ""' % key
+
         # Find absolute path of file (if needed)
         if "@transitions" in path:
             new_path = path.replace("@transitions", os.path.join(info.PATH, "transitions"))
+            new_path = os.path.normpath(new_path)
+            new_path = json.dumps(new_path, ensure_ascii=False)
+            return '"%s": %s' % (key, new_path)
+
+        elif "@colors" in path:
+            new_path = path.replace("@colors", os.path.join(info.COLORS_PATH))
             new_path = json.dumps(new_path, ensure_ascii=False)
             return '"%s": %s' % (key, new_path)
 
@@ -253,8 +280,8 @@ class JsonDataStore:
             # Optimized regex replacement
             data = re.sub(path_regex, self.replace_string_to_absolute, data)
 
-        except Exception as ex:
-            log.error("Error while converting relative paths to absolute paths: %s" % str(ex))
+        except Exception:
+            log.error("Error while converting relative paths to absolute paths", exc_info=1)
 
         return data
 
@@ -262,18 +289,31 @@ class JsonDataStore:
         """Replace matched string for converting paths to relative paths"""
         key = match.groups(0)[0]
         path = match.groups(0)[1]
+
+        # Convert escaped path back into python str.
+        # Some characters, such as backslashes and quotes
+        # are escaped during the JSON dumps() conversion.
+        #   /Videos/quote \\"/  instead of  /Videos/quote "/
+        path = json.loads('"%s"' % path)
+
+        if path == "":
+            return '"%s": ""' % key
+
+        # Split path into folder and file
         folder_path, file_path = os.path.split(os.path.abspath(path))
 
         # Determine if thumbnail path is found
         if info.THUMBNAIL_PATH in folder_path:
-            # Convert path to relative thumbnail path
+            log.debug("Generating relative thumbnail path to %s in %s",
+                      file_path, folder_path)
             new_path = os.path.join("thumbnail", file_path).replace("\\", "/")
             new_path = json.dumps(new_path, ensure_ascii=False)
             return '"%s": %s' % (key, new_path)
 
         # Determine if @transitions path is found
         elif os.path.join(info.PATH, "transitions") in folder_path:
-            # Yes, this is an OpenShot transition
+            log.debug("Generating relative @transitions path for %s in %s",
+                      file_path, folder_path)
             folder_path, category_path = os.path.split(folder_path)
 
             # Convert path to @transitions/ path
@@ -281,17 +321,23 @@ class JsonDataStore:
             new_path = json.dumps(new_path, ensure_ascii=False)
             return '"%s": %s' % (key, new_path)
 
+        # Determine if @colors path is found
+        elif info.COLORS_PATH in folder_path:
+            rel = os.path.relpath(os.path.join(folder_path, file_path), info.COLORS_PATH)
+            path = json.dumps(f"@colors/{rel.replace(os.sep, '/')}", ensure_ascii=False)
+            return f'"{key}": {path}'
+
         # Determine if @emojis path is found
         elif os.path.join(info.PATH, "emojis") in folder_path:
-            # Yes, this is an OpenShot emoji
-            # Convert path to @emojis/ path
+            log.debug("Generating relative @emojis path for %s in %s",
+                      file_path, folder_path)
             new_path = os.path.join("@emojis", file_path).replace("\\", "/")
             new_path = json.dumps(new_path, ensure_ascii=False)
             return '"%s": %s' % (key, new_path)
 
         # Determine if @assets path is found
         elif path_context["new_project_assets"] in folder_path:
-            # Yes, this is an OpenShot transitions
+            log.debug("Replacing path to %s in %s", file_path, folder_path)
             folder_path = folder_path.replace(path_context["new_project_assets"], "@assets")
 
             # Convert path to @assets/ path
@@ -304,10 +350,20 @@ class JsonDataStore:
             # Convert path to the correct relative path (based on the existing folder)
             orig_abs_path = os.path.abspath(path)
 
+            # Determine windows drives that the project and file are on
+            project_win_drive = os.path.splitdrive(path_context.get("new_project_folder", ""))[0]
+            file_win_drive = os.path.splitdrive(path)[0]
+            if file_win_drive != project_win_drive:
+                log.debug("Drive mismatch, not making path relative: %s", orig_abs_path)
+                # If the file is on different drive. Don't abbreviate the path.
+                clean_path = orig_abs_path.replace("\\", "/")
+                clean_path = json.dumps(clean_path, ensure_ascii=False)
+                return f"\"{key}\": {clean_path}"
+
             # Remove file from abs path
             orig_abs_folder = os.path.dirname(orig_abs_path)
 
-            # Calculate new relateive path
+            log.debug("Generating new relative path for %s", orig_abs_path)
             new_rel_path_folder = os.path.relpath(orig_abs_folder, path_context.get("new_project_folder", ""))
             new_rel_path = os.path.join(new_rel_path_folder, file_path).replace("\\", "/")
             new_rel_path = json.dumps(new_rel_path, ensure_ascii=False)
@@ -328,13 +384,15 @@ class JsonDataStore:
             # Optimized regex replacement
             data = re.sub(path_regex, self.replace_string_to_relative, data)
 
-        except Exception as ex:
-            log.error("Error while converting absolute paths to relative paths: %s" % str(ex))
+        except Exception:
+            log.error("Error while converting absolute paths to relative paths", exc_info=1)
 
         return data
 
     def make_repair_backup(self, file_path, jsondata, backup_dir=None):
         """ Make a backup copy of an OSP file before performing recovery """
+        app = get_app()
+        _ = app._tr
 
         if backup_dir:
             backup_base = os.path.join(backup_dir, os.path.basename(file_path))
@@ -357,10 +415,8 @@ class JsonDataStore:
             with open(backup_file, "w") as fout:
                 fout.write(jsondata)
 
-            if hasattr(self.app, "window") and hasattr(self.app.window, "statusBar"):
-                self.app.window.statusBar.showMessage(
-                    self._("Saved backup file {}").format(backup_file), 5000
-                )
+            if hasattr(app, "window") and hasattr(app.window, "statusBar"):
+                app.window.statusBar.showMessage(_("Saved backup file {}").format(backup_file), 5000)
             log.info("Backed up {} as {}".format(file_path, backup_file))
         except (PermissionError, FileExistsError) as ex:
             # Couldn't write to backup file! Try alternate location

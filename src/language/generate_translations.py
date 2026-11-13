@@ -22,7 +22,7 @@
 		$ msgfmt es.po --output-file=es/LC_MESSAGES/OpenShot.mo
 
  Command to compile all PO files in a folder
-		$ find -iname "*.po" -exec msgfmt {} -o {}.mo \;
+		$ find -iname "*.po" -exec msgfmt {} -o {}.mo \\;
 
  Command to combine the 2 pot files into 1 file
        $ msgcat ~/openshot/locale/OpenShot/OpenShot_source.pot ~/openshot/openshot/locale/OpenShot/OpenShot_glade.pot -o ~/openshot/main/locale/OpenShot/OpenShot.pot
@@ -54,6 +54,7 @@ import datetime
 import os
 import subprocess
 import sys
+import re
 import json
 
 # Try to get the security-patched XML functions from defusedxml
@@ -71,6 +72,7 @@ if path not in sys.path:
 
 import classes.info as info
 from classes.logger import log
+from classes.effect_init import effect_options
 
 # get the path of the main OpenShot folder
 language_folder_path = os.path.dirname(os.path.abspath(__file__))
@@ -101,8 +103,8 @@ log.info(" Using xgettext to generate .py POT files")
 log.info("-----------------------------------------------------")
 
 # Generate POT for Source Code strings (i.e. strings marked with a _("translate me"))
-subprocess.call('find %s -iname "*.py" -exec xgettext -j -o %s --keyword=_ {} \;' % (
-openshot_path, os.path.join(language_folder_path, 'OpenShot_source.pot')), shell=True)
+subprocess.call(r'find %s -iname "*.py" -exec xgettext --from-code=UTF-8 -j -o %s --keyword=_ --keyword=N_ --keyword=_tr {} \;' % (
+    openshot_path, os.path.join(language_folder_path, 'OpenShot_source.pot')), shell=True)
 
 log.info("-----------------------------------------------------")
 log.info(" Using Qt's lupdate to generate .ui POT files")
@@ -154,46 +156,47 @@ for temp_file in temp_files:
     f.close()
 
 log.info("-----------------------------------------------------")
-log.info(" Scanning custom XML files and finding text")
+log.info(" Scanning effects & resources used by OpenShot")
 log.info("-----------------------------------------------------")
 
-# Loop through the Effects XML
+props = json.loads(openshot.Clip().PropertiesJSON(1))
+
+# Loop through props
 effects_text = {}
-for file in os.listdir(effects_path):
-    if os.path.isfile(os.path.join(effects_path, file)):
-        # load xml effect file
-        full_file_path = os.path.join(effects_path, file)
-        xmldoc = xml.parse(os.path.join(effects_path, file))
+for key in props.keys():
+    property = props[key]
+    if "name" in property:
+        effects_text[property["name"]] = "libopenshot (Clip Properties)"
+    if "choices" in property:
+        for choice in property["choices"]:
+            effects_text[choice["name"]] = "libopenshot (Clip Properties)"
 
-        # add text to list
-        effects_text[xmldoc.getElementsByTagName("title")[0].childNodes[0].data] = full_file_path
-        effects_text[xmldoc.getElementsByTagName("description")[0].childNodes[0].data] = full_file_path
-
-        # get params
-        params = xmldoc.getElementsByTagName("param")
-
-        # Loop through params
-        for param in params:
-            if param.attributes["title"]:
-                effects_text[param.attributes["title"].value] = full_file_path
-
-# Append on properties from libopenshot
-objects = [openshot.Clip(), openshot.Bars(), openshot.Blur(), openshot.Brightness(),
-           openshot.ChromaKey(), openshot.ColorShift(), openshot.Crop(), openshot.Deinterlace(), openshot.Hue(), openshot.Mask(),
-           openshot.Negate(), openshot.Pixelate(), openshot.Saturation(), openshot.Shift(), openshot.Wave()]
-
-# Loop through each libopenshot object
+# Loop through each libopenshot effect
+objects = json.loads(openshot.EffectInfo.Json())
 for object in objects:
-    props = json.loads(object.PropertiesJSON(1))
+    class_name = object.get("class_name")
+    props = json.loads(openshot.EffectInfo().CreateEffect(class_name).PropertiesJSON(1))
 
     # Loop through props
     for key in props.keys():
-        object = props[key]
-        if "name" in object.keys():
-            effects_text[object["name"]] = "libopenshot (Clip Properties)"
-        if "choices" in object.keys():
-            for choice in object["choices"]:
-                effects_text[choice["name"]] = "libopenshot (Clip Properties)"
+        property = props[key]
+        if key == "objects":
+            continue # Skip tracker / object detection property
+        if "name" in property:
+            effects_text[property["name"]] = "libopenshot (Effect Properties)"
+        if "choices" in object:
+            for choice in property["choices"]:
+                effects_text[choice["name"]] = "libopenshot (Effect Properties)"
+
+# Append Effect Init Data
+# Loop through props
+for effect in effect_options:
+    for param in effect_options[effect]:
+        if "title" in param:
+            effects_text[param["title"]] = "effect_init (Effect parameter for %s)" % effect
+        if "values" in param:
+            for value in param["values"]:
+                effects_text[value["name"]] = "effect_init (Effect parameter for %s)" % effect
 
 # Append Effect Meta Data
 e = openshot.EffectInfo()
@@ -206,9 +209,24 @@ for effect in props:
     if "description" in effect:
         effects_text[effect["description"]] = "libopenshot (Effect Metadata)"
 
+# Append LUT category and file names (for ColorMap effect)
+for folder in os.listdir(info.COLORS_PATH):
+    category_name = folder.replace("_", " ").title()
+    folder_path = os.path.join(info.COLORS_PATH, folder)
+    if os.path.isdir(folder_path):
+        for filename in os.listdir(folder_path):
+            basename, extension = os.path.splitext(filename)
+            if filename.endswith(".cube"):
+                lut_name = basename.replace("_", " ").title()
+                effects_text[category_name] = "ColorMap effect lookup (Category)"
+                effects_text[lut_name] = "ColorMap effect lookup (Name)"
+
 # Append Emoji Data
 emoji_text = { "translator-credits": "Translator credits to be translated by LaunchPad" }
 emoji_metadata_path = os.path.join(info.PATH, "emojis", "data", "openmoji-optimized.json")
+emoji_ignore_keys = ("Keyboard", "Sunset", "Key", "Right arrow", "Left arrow", "Bubbles",
+                     "Twitter", "Instagram", "Scale", "Simple", "Close", "Forward", "Copy",
+                     "Filter", "Details", "Duplicate", "Edit", "Delete")
 with open(emoji_metadata_path, 'r', encoding="utf-8") as f:
     emoji_metadata = json.load(f)
 
@@ -216,13 +234,14 @@ with open(emoji_metadata_path, 'r', encoding="utf-8") as f:
     for filename, emoji in emoji_metadata.items():
         emoji_name = emoji["annotation"].capitalize()
         emoji_group = emoji["group"].split('-')[0].capitalize()
-        if "annotation" in emoji:
+        if "annotation" in emoji and emoji_name not in emoji_ignore_keys:
             emoji_text[emoji_name] = "Emoji Metadata (Displayed Name)"
-        if "group" in emoji and emoji_group not in effects_text:
+        if "group" in emoji and emoji_group not in effects_text and emoji_group not in emoji_ignore_keys:
             emoji_text[emoji_group] = "Emoji Metadata (Group Filter name)"
 
 # Loop through the Blender XML
 blender_text = { "translator-credits": "Translator credits to be translated by LaunchPad" }
+blender_ignore_keys = ("Title", "Alpha", "Blur", "Font Name", "Yes", "No", "On", "Off", "Default")
 for file in os.listdir(blender_path):
     if os.path.isfile(os.path.join(blender_path, file)):
         # load xml effect file
@@ -230,7 +249,9 @@ for file in os.listdir(blender_path):
         xmldoc = xml.parse(os.path.join(blender_path, file))
 
         # add text to list
-        blender_text[xmldoc.getElementsByTagName("title")[0].childNodes[0].data] = full_file_path
+        translation_key = xmldoc.getElementsByTagName("title")[0].childNodes[0].data
+        if translation_key not in blender_ignore_keys:
+            blender_text[translation_key] = full_file_path
 
         # get params
         params = xmldoc.getElementsByTagName("param")
@@ -238,7 +259,18 @@ for file in os.listdir(blender_path):
         # Loop through params
         for param in params:
             if param.attributes["title"]:
-                blender_text[param.attributes["title"].value] = full_file_path
+                translation_key = param.attributes["title"].value
+                if translation_key not in blender_ignore_keys:
+                    blender_text[param.attributes["title"].value] = full_file_path
+
+                    # Loop through child nodes of each param
+                    for child in param.childNodes:
+                        if child.nodeName == "values":
+                            for value in child.getElementsByTagName("value"):
+                                if value.hasAttribute("name"):
+                                    value_name = value.getAttribute("name")
+                                    if value_name not in blender_ignore_keys:
+                                        blender_text[value_name] = full_file_path
 
 # Loop through the Export Settings XML
 export_text = {}
@@ -270,8 +302,27 @@ for setting in settings:
             for value in setting.get("values", []):
                 export_text[value["name"]] = "Settings for %s" % setting["setting"]
 
+# Include UI Theme Names (for translation)
+from themes.manager import ThemeName
+for theme_name in ThemeName.get_sorted_theme_names():
+    export_text[theme_name] = "User-Interface Theme Name"
+
+# Include AI model names and descriptions shown in model dropdowns.
+for manifest_name in ("yolo-models.json", "cutie-models.json", "efficient-sam-models.json"):
+    manifest_path = os.path.join(info.RESOURCES_PATH, manifest_name)
+    if not os.path.exists(manifest_path):
+        continue
+    with open(manifest_path, "r", encoding="utf-8") as manifest_file:
+        manifest = json.load(manifest_file)
+    for model in manifest.get("models", []):
+        if model.get("name"):
+            export_text[model["name"]] = "AI model dropdown (%s name)" % manifest_name
+        if model.get("description"):
+            export_text[model["description"]] = "AI model dropdown (%s description)" % manifest_name
+
 # Loop through transitions and add to POT file
 transitions_text = { "translator-credits": "Translator credits to be translated by LaunchPad" }
+transitions_ignore_keys = ("Common", "Fade")
 for file in os.listdir(transitions_path):
     # load xml export file
     full_file_path = os.path.join(transitions_path, file)
@@ -281,7 +332,8 @@ for file in os.listdir(transitions_path):
     name = fileBaseName.replace("_", " ").capitalize()
 
     # add text to list
-    transitions_text[name] = full_file_path
+    if name not in transitions_ignore_keys:
+        transitions_text[name] = full_file_path
 
     # Look in sub-folders
     for sub_file in os.listdir(full_file_path):
@@ -303,7 +355,8 @@ for file in os.listdir(transitions_path):
             name = name.replace(suffix_number, "%s")
 
         # add text to list
-        transitions_text[name] = full_subfile_path
+        if name not in transitions_ignore_keys:
+            transitions_text[name] = full_subfile_path
 
 # Loop through titles and add to POT file
 for sub_file in os.listdir(titles_path):
@@ -453,4 +506,25 @@ for temp_file_name in temp_files:
 log.info("-----------------------------------------------------")
 log.info(" The OpenShot.pot file has been successfully created ")
 log.info(" with all text in OpenShot.")
+log.info("")
+log.info(" Checking for duplicate keys...")
 log.info("-----------------------------------------------------")
+
+# Find any duplicate translations between our 4 template files
+# If these duplicates are translated differently, we will end up
+# with conflicts, and both translations will be combined incorrectly
+all_strings = {}
+
+for pot_file in [
+    'OpenShot.pot',
+    'OpenShot_transitions.pot',
+    'OpenShot_blender.pot',
+    'OpenShot_emojis.pot',
+]:
+    with open(os.path.join(language_folder_path, "OpenShot", pot_file)) as f:
+        data = f.read()
+        for key in re.findall('^msgid \"(.*)\"', data, re.MULTILINE):
+            if key not in all_strings:
+                all_strings[key] = "%s | %s" % (key, pot_file)
+            elif key and key not in ('translator-credits', ):
+                log.info(' ERROR: Duplicate key found: %s::%s' % (pot_file, all_strings[key]))

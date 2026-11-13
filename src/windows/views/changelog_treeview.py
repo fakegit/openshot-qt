@@ -26,28 +26,28 @@
  along with OpenShot Library.  If not, see <http://www.gnu.org/licenses/>.
  """
 
-import os
 import webbrowser
-from urllib.parse import urlparse
 from functools import partial
 
-from PyQt5.QtCore import QSize, Qt, QPoint
-from PyQt5.QtWidgets import QListView, QTreeView, QMessageBox, QAbstractItemView, QMenu, QSizePolicy, QHeaderView, QApplication
-from PyQt5.QtGui import QCursor
+from qt_api import Qt
+from qt_api import QTreeView, QAbstractItemView, QSizePolicy, QHeaderView, QApplication
+from qt_api import QCursor
+from qt_api import make_filter_regex, set_proxy_filter
 
 from classes.logger import log
 from classes.app import get_app
 from windows.models.changelog_model import ChangelogModel
+from .menu import StyledContextMenu
 
-import json
 
 class ChangelogTreeView(QTreeView):
     """ A ListView QWidget used on the changelog window """
     def resize_contents(self):
         pass
 
-    def refresh_view(self, filter=None):
-        self.changelog_model.update_model(filter=filter)
+    def refresh_view(self):
+        """Format columns and sort"""
+        # Model already populated
 
         # Format columns
         self.header().setSectionResizeMode(0, QHeaderView.Fixed)
@@ -57,19 +57,27 @@ class ChangelogTreeView(QTreeView):
         self.setColumnWidth(2, 125)
         self.setColumnWidth(3, 200)
 
+    def filter_changed(self, text=""):
+        """Apply filter text to proxy model"""
+        regex = make_filter_regex(text, case_insensitive=True)
+        set_proxy_filter(self.model(), regex)
+        self.model().setFilterKeyColumn(-1)
+        self.model().sort(1, Qt.AscendingOrder)
+
     def contextMenuEvent(self, event):
         log.info('contextMenuEvent')
+        _ = get_app()._tr
 
         # Get data model and selection
-        model = self.changelog_model.model
-        row = self.indexAt(event.pos()).row()
-        if row != -1:
-            selected_hash = model.item(row, 0).text()
+        model = self.model()
+        index = self.indexAt(event.pos())
+        if index.isValid():
+            selected_hash = model.index(index.row(), 0).data()
 
-            menu = QMenu(self)
-            copy_action = menu.addAction("Copy Hash")
+            menu = StyledContextMenu(parent=self)
+            copy_action = menu.addAction(_("Copy Hash"))
             copy_action.triggered.connect(partial(self.CopyHashMenuTriggered, selected_hash))
-            github_action = menu.addAction("View on GitHub")
+            github_action = menu.addAction(_("View on GitHub"))
             github_action.triggered.connect(partial(self.ChangelogMenuTriggered, selected_hash))
             menu.popup(QCursor.pos())
 
@@ -83,12 +91,12 @@ class ChangelogTreeView(QTreeView):
 
         try:
             webbrowser.open(self.commit_url % hash)
-        except:
+        except Exception:
             log.warning('Failed to launch web browser to %s' % self.commit_url)
 
     def __init__(self, commits, commit_url, *args):
         # Invoke parent init
-        QListView.__init__(self, *args)
+        QTreeView.__init__(self, *args)
 
         # Get a reference to the window object
         self.win = get_app().window
@@ -97,19 +105,20 @@ class ChangelogTreeView(QTreeView):
         self.changelog_model = ChangelogModel(commits)
         self.selected = []
 
+        # Populate model
+        self.changelog_model.update_model()
+
         # Setup header columns
-        self.setModel(self.changelog_model.model)
+        self.setModel(self.changelog_model.proxy_model)
         self.setIndentation(0)
         self.setSelectionBehavior(QTreeView.SelectRows)
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setWordWrap(True)
-        self.setStyleSheet('QTreeView::item { padding-top: 2px; }')
+        self.selectionModel().deleteLater()
+        self.setSelectionModel(self.changelog_model.selection_model)
         self.commit_url = commit_url
 
         # Refresh view
         self.refresh_view()
-
-        # setup filter events
-        app = get_app()

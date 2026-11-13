@@ -27,18 +27,21 @@
  """
 
 import os
+import uuid
 from operator import itemgetter
 from random import shuffle, randint, uniform
 
-from PyQt5.QtWidgets import QDialog
-from PyQt5.QtGui import QIcon
+from qt_api import QLocale
+from qt_api import QDialog
+from qt_api import QIcon
 
-from classes import settings
 from classes import info, ui_util, time_parts
 from classes.logger import log
 from classes.query import Clip, Transition
 from classes.app import get_app
 from classes.metrics import track_metric_screen
+from classes.clip_utils import apply_file_caption_to_clip
+from classes.keyframe_editing import initialize_split_clip_keyframes
 from windows.views.add_to_timeline_treeview import TimelineTreeView
 
 import openshot
@@ -49,6 +52,38 @@ class AddToTimeline(QDialog):
     """ Add To timeline Dialog """
 
     ui_path = os.path.join(info.PATH, 'windows', 'ui', 'add-to-timeline.ui')
+
+    def _select_added_items(self, win, added_clip_ids):
+        """Select only the newly added clips, matching timeline drag/drop behavior."""
+        if not win or not added_clip_ids:
+            return
+
+        timeline_view = getattr(win, "timeline", None)
+        for idx, clip_id in enumerate(added_clip_ids):
+            if not clip_id:
+                continue
+            if timeline_view and hasattr(timeline_view, "AddSelectionJS"):
+                timeline_view.AddSelectionJS(str(clip_id), "clip", idx == 0)
+            else:
+                win.addSelection(str(clip_id), "clip", clear_existing=(idx == 0))
+
+        files_model = getattr(win, "files_model", None)
+        if files_model:
+            selection_model = getattr(files_model, "selection_model", None)
+            if selection_model:
+                selection_model.clearSelection()
+            list_selection_model = getattr(files_model, "list_selection_model", None)
+            if list_selection_model:
+                list_selection_model.clearSelection()
+
+        if timeline_view and hasattr(timeline_view, "setFocus"):
+            timeline_view.setFocus()
+        if timeline_view and hasattr(timeline_view, "geometry"):
+            timeline_geometry = getattr(timeline_view, "geometry", None)
+            if hasattr(timeline_geometry, "mark_dirty"):
+                timeline_geometry.mark_dirty()
+        if timeline_view and hasattr(timeline_view, "update"):
+            timeline_view.update()
 
     def btnMoveUpClicked(self, checked):
         """Callback for move up button click"""
@@ -61,16 +96,20 @@ class AddToTimeline(QDialog):
         if self.treeFiles.selected:
             selected_index = self.treeFiles.selected.row()
 
-        # Ignore if empty files
+        # Ignore if empty files or no selection
         if not files or selected_index is None:
             return
 
-        # New index
-        new_index = max(selected_index - 1, 0)
-        log.info(new_index)
+        # Check if selected_index is within valid range
+        if 0 <= selected_index < len(files):
+            # New index
+            new_index = max(selected_index - 1, 0)
 
-        # Remove item and move it
-        files.insert(new_index, files.pop(selected_index))
+            # Remove item and move it
+            files.insert(new_index, files.pop(selected_index))
+        else:
+            log.warning(f"Invalid selected_index: {selected_index}, list length: {len(files)}")
+            return
 
         # Refresh tree
         self.treeFiles.refresh_view()
@@ -90,16 +129,20 @@ class AddToTimeline(QDialog):
         if self.treeFiles.selected:
             selected_index = self.treeFiles.selected.row()
 
-        # Ignore if empty files
+        # Ignore if empty files or no selection
         if not files or selected_index is None:
             return
 
-        # New index
-        new_index = min(selected_index + 1, len(files) - 1)
-        log.info(new_index)
+        # Check if selected_index is within valid range
+        if 0 <= selected_index < len(files):
+            # New index
+            new_index = min(selected_index + 1, len(files) - 1)
 
-        # Remove item and move it
-        files.insert(new_index, files.pop(selected_index))
+            # Remove item and move it
+            files.insert(new_index, files.pop(selected_index))
+        else:
+            log.warning(f"Invalid selected_index: {selected_index}, list length: {len(files)}")
+            return
 
         # Refresh tree
         self.treeFiles.refresh_view()
@@ -153,6 +196,10 @@ class AddToTimeline(QDialog):
         """ Ok button clicked """
         log.info('accept')
 
+        # Transaction id to group all updates together
+        tid = str(uuid.uuid4())
+        get_app().updates.transaction_id = tid
+
         # Get settings from form
         start_position = self.txtStartTime.value()
         track_num = self.cmbTrack.currentData()
@@ -174,6 +221,9 @@ class AddToTimeline(QDialog):
         fps = get_app().project.get("fps")
         fps_float = float(fps["num"]) / float(fps["den"])
 
+        # Track added clip IDs for auto-selection
+        added_clip_ids = []
+
         # Loop through each file (in the current order)
         for file in self.treeFiles.timeline_model.files:
             # Create a clip
@@ -187,39 +237,34 @@ class AddToTimeline(QDialog):
             file_path = file.absolute_path()
 
             # Create clip object for this file
-            c = openshot.Clip(file_path)
-
-            # Append missing attributes to Clip JSON
-            new_clip = json.loads(c.Json())
+            if file.data.get("type") == "QtTextReader":
+                from classes.direct_text import new_text_clip
+                new_clip = new_text_clip(file.data["direct_text"], None, position, track_num, image_length)
+            else:
+                c = openshot.Clip(file_path)
+                new_clip = json.loads(c.Json())
             new_clip["position"] = position
             new_clip["layer"] = track_num
             new_clip["file_id"] = file.id
-            new_clip["title"] = filename
+            new_clip["title"] = file.data.get("name", filename)
+            new_clip["reader"] = file.data
 
             # Skip any clips that are missing a 'reader' attribute
             # TODO: Determine why this even happens, as it shouldn't be possible
             if not new_clip.get("reader"):
                 continue  # Skip to next file
 
-            # Overwrite frame rate (incase the user changed it in the File Properties)
-            file_properties_fps = float(file.data["fps"]["num"]) / float(file.data["fps"]["den"])
-            file_fps = float(new_clip["reader"]["fps"]["num"]) / float(new_clip["reader"]["fps"]["den"])
-            fps_diff = file_fps / file_properties_fps
-            new_clip["reader"]["fps"]["num"] = file.data["fps"]["num"]
-            new_clip["reader"]["fps"]["den"] = file.data["fps"]["den"]
-            # Scale duration / length / and end properties
-            new_clip["reader"]["duration"] *= fps_diff
-            new_clip["end"] *= fps_diff
-            new_clip["duration"] *= fps_diff
+            # If the source file has stored caption text, attach a Caption effect to this new clip.
+            apply_file_caption_to_clip(new_clip, file)
 
             # Check for optional start and end attributes
             start_time = 0
             end_time = new_clip["reader"]["duration"]
 
-            if 'start' in file.data.keys():
+            if 'start' in file.data:
                 start_time = file.data['start']
                 new_clip["start"] = start_time
-            if 'end' in file.data.keys():
+            if 'end' in file.data:
                 end_time = file.data['end']
                 new_clip["end"] = end_time
 
@@ -227,6 +272,8 @@ class AddToTimeline(QDialog):
             new_clip["duration"] = new_clip["reader"]["duration"]
             if file.data["media_type"] == "image":
                 end_time = image_length
+                new_clip["end"] = end_time
+            else:
                 new_clip["end"] = end_time
 
             # Adjust Fade of Clips (if no transition is chosen)
@@ -330,7 +377,7 @@ class AddToTimeline(QDialog):
                 # Add transition for this clip (if any)
                 # Open up QtImageReader for transition Image
                 if random_transition:
-                    random_index = randint(0, len(self.transitions))
+                    random_index = randint(0, len(self.transitions) - 1)
                     transition_path = self.transitions[random_index]
 
                 # Get reader for transition
@@ -370,12 +417,32 @@ class AddToTimeline(QDialog):
                 tran.data = transitions_data
                 tran.save()
 
+            initialize_split_clip_keyframes(new_clip, fps_float)
+
             # Save Clip
             clip.data = new_clip
             clip.save()
+            added_clip_ids.append(clip.data.get("id"))
 
             # Increment position by length of clip
             position += (end_time - start_time)
+
+        # Clear transaction
+        get_app().updates.transaction_id = None
+
+        win = get_app().window
+
+        # Ensure project duration grows to include all newly-added items.
+        timeline_view = getattr(win, "timeline", None)
+        extend_timeline = getattr(timeline_view, "_extend_timeline_to_fit_items", None)
+        if callable(extend_timeline):
+            try:
+                extend_timeline()
+            except Exception:
+                log.warning("Failed to extend timeline after Add to Timeline", exc_info=1)
+
+        # Auto-select newly added clips, like timeline drag/drop does.
+        self._select_added_items(win, added_clip_ids)
 
         # Accept dialog
         super(AddToTimeline, self).accept()
@@ -429,7 +496,7 @@ class AddToTimeline(QDialog):
 
     def __init__(self, files=None, position=0.0):
         # Create dialog class
-        QDialog.__init__(self)
+        super().__init__()
 
         # Load UI from Designer
         ui_util.load_ui(self, self.ui_path)
@@ -437,12 +504,12 @@ class AddToTimeline(QDialog):
         # Init UI
         ui_util.init_ui(self)
 
-        # Get settings
-        self.settings = settings.get_settings()
-
         # Get translation object
         self.app = get_app()
         _ = self.app._tr
+
+        # Get settings
+        self.settings = self.app.get_settings()
 
         # Track metrics
         track_metric_screen("add-to-timeline-screen")
@@ -453,9 +520,6 @@ class AddToTimeline(QDialog):
 
         # Update data in model
         self.treeFiles.timeline_model.update_model(files)
-
-        # Refresh view
-        self.treeFiles.refresh_view()
 
         # Init start position
         self.txtStartTime.setValue(position)
@@ -473,7 +537,7 @@ class AddToTimeline(QDialog):
         display_count = len(all_tracks)
         for track in reversed(sorted(all_tracks, key=itemgetter('number'))):
             # Add to dropdown
-            track_name = track.get('label') or _("Track %s") % display_count
+            track_name = track.get('label') or _("Track %s") % QLocale().toString(display_count)
             self.cmbTrack.addItem(track_name, track.get('number'))
             display_count -= 1
 
@@ -523,7 +587,7 @@ class AddToTimeline(QDialog):
                 # replace suffix number with placeholder (if any)
                 if suffix_number:
                     trans_name = trans_name.replace(suffix_number, "%s")
-                    trans_name = _(trans_name) % suffix_number
+                    trans_name = _(trans_name) % QLocale().toString(int(suffix_number))
                 else:
                     trans_name = _(trans_name)
 

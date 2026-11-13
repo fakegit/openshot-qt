@@ -18,6 +18,7 @@
 # documentation root, use os.path.abspath to make it absolute, like shown here.
 #
 import os
+import re
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath('.')), "src"))
 
@@ -33,7 +34,8 @@ from classes import info
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
 extensions = [
-    'sphinx.ext.extlinks'
+    'sphinx.ext.extlinks',
+    #'sphinx_markdown_builder' (pip3 install sphinx_markdown_builder)
 ]
 
 try:
@@ -57,11 +59,9 @@ except ImportError:
 extlinks = {
     # alias: (url_template, prefix)
     'openshot-github':
-        ('https://github.com/OpenShot/%s', ''),
+        ('https://github.com/OpenShot/%s', '%s'),
     'libopenshot-wiki':
-        ('https://github.com/OpenShot/libopenshot/wiki/%s', ''),
-    'openshot-issue':
-        ('https://github.com/OpenShot/openshot-qt/issues/%s', 'issue ')
+        ('https://github.com/OpenShot/libopenshot/wiki/%s', '%s'),
 }
 
 # Add any paths that contain templates here, relative to this directory.
@@ -99,7 +99,8 @@ release = info.VERSION
 #
 # This is also used if you do content translation via gettext catalogs.
 # Usually you set "language" from the command line for these cases.
-language = None
+language = "en"
+locale_dirs = ["locale/"]
 
 # There are two options for replacing |today|: either, you set today to some
 # non-false value, then it is used:
@@ -113,7 +114,7 @@ language = None
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
 # This patterns also effect to html_static_path and html_extra_path
-exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store']
+exclude_patterns = ['issue-6177-verification.rst', '_build', 'Thumbs.db', '.DS_Store']
 
 # The reST default role (used for this markup: `text`) to use for all
 # documents.
@@ -154,6 +155,9 @@ todo_include_todos = False
 #
 html_theme = 'sphinx_rtd_theme'
 
+# Optional GA4 measurement ID for HTML builds (set via -D ga4_measurement_id=G-XXXX).
+ga4_measurement_id = None
+
 # Theme options are theme-specific and customize the look and feel of a theme
 # further.  For a list of options available for each theme, see the
 # documentation.
@@ -187,6 +191,10 @@ html_favicon = "../xdg/openshot-qt.ico"
 # relative to this directory. They are copied after the builtin static files,
 # so a file named "default.css" will overwrite the builtin "default.css".
 html_static_path = ['css']
+
+# Use XeLaTeX for Unicode/RTL language support in PDF output.
+latex_engine = "xelatex"
+
 
 # Add any extra paths that contain custom files (such as robots.txt or
 # .htaccess) here, relative to this directory. These files are copied
@@ -271,6 +279,8 @@ htmlhelp_basename = 'OpenShotVideoEditordoc'
 # -- Options for LaTeX output ---------------------------------------------
 
 latex_elements = {
+    # Export PDF without blank pages
+    'extraclassoptions': 'openany,oneside'
     # The paper size ('letterpaper' or 'a4paper').
     #
     # 'papersize': 'letterpaper',
@@ -288,12 +298,167 @@ latex_elements = {
     # 'figure_align': 'htbp',
 }
 
+def _configure_latex_fonts(app, config):
+    lang = (config.language or "").lower()
+    if lang.startswith("ja"):
+        config.latex_docclass = {"manual": "report"}
+    latex_elements = dict(config.latex_elements or {})
+
+    fontpkg = r"""
+\usepackage{fontspec}
+\defaultfontfeatures{Ligatures=TeX,Scale=MatchLowercase}
+
+% Global fonts must support Latin because Sphinx headings/UI/macros use these.
+\setmainfont{Noto Serif}
+\setsansfont{Noto Sans}
+\setmonofont{Noto Sans Mono}[Scale=0.9]
+\usepackage{newunicodechar}
+\newfontfamily\openshotsymbolfont{DejaVu Sans}
+\newunicodechar{→}{{\openshotsymbolfont →}}
+\newunicodechar{←}{{\openshotsymbolfont ←}}
+\newunicodechar{↔}{{\openshotsymbolfont ↔}}
+\newunicodechar{␣}{{\openshotsymbolfont ␣}}
+"""
+
+    preamble = latex_elements.get("preamble", "")
+    preamble += r'\sphinxsetup{verbatimvisiblespace={\textcolor{red}{\openshotsymbolfont\char"2423}}}'
+    if lang.startswith("bn"):
+        # Keep Bengali shaping while preserving Latin text in commands.
+        fontpkg += r"""
+\usepackage{ucharclasses}
+\newfontfamily\bengalifont[
+  Script=Bengali,
+  AutoFakeSlant=0.2,
+  AutoFakeBold=2.0
+]{Noto Sans Bengali}
+\setTransitionsFor{Bengali}{\begingroup\bengalifont}{\endgroup}
+\newunicodechar{।}{{\bengalifont ।}}
+\newfontfamily\openshotarabicfallback[Script=Arabic,ItalicFont={DejaVu Sans},ItalicFeatures={FakeSlant=0.2},BoldItalicFont={DejaVu Sans Bold},BoldItalicFeatures={FakeSlant=0.2}]{DejaVu Sans}
+
+\newfontfamily\openshotkoreanfallback{Noto Sans CJK KR}
+
+"""
+
+    if lang.startswith(("ar", "fa")):
+        fontpkg += r"""
+\setmonofont{DejaVu Sans Mono}[ItalicFont={DejaVu Sans Mono},ItalicFeatures={FakeSlant=0.2}]
+\newfontfamily\openshotcjkfallback{Noto Sans CJK SC}
+\newunicodechar{粗}{{\openshotcjkfallback 粗}}
+\newfontfamily\arabicfont[Script=Arabic,ItalicFont={DejaVu Sans},ItalicFeatures={FakeSlant=0.2},BoldItalicFont={DejaVu Sans Bold},BoldItalicFeatures={FakeSlant=0.2}]{DejaVu Sans}
+\newfontfamily\arabicfontsf[Script=Arabic,ItalicFont={DejaVu Sans},ItalicFeatures={FakeSlant=0.2},BoldItalicFont={DejaVu Sans Bold},BoldItalicFeatures={FakeSlant=0.2}]{DejaVu Sans}
+\newfontfamily\arabicfonttt[Script=Arabic,ItalicFont={DejaVu Sans Mono},ItalicFeatures={FakeSlant=0.2}]{DejaVu Sans Mono}
+"""
+    elif lang.startswith("hi"):
+        fontpkg += r"""
+\usepackage{ucharclasses}
+\newfontfamily\devanagarifont[Script=Devanagari,AutoFakeSlant=0.2]{Noto Sans Devanagari}
+
+\newfontfamily\openshotbengalifallback[Script=Bengali]{Noto Sans Bengali}
+\newfontfamily\devanagarifontsf[Script=Devanagari,AutoFakeSlant=0.2]{Noto Sans Devanagari}
+\newfontfamily\devanagarifonttt[Script=Devanagari,AutoFakeSlant=0.2]{Noto Sans Devanagari}
+"""
+    elif lang.startswith(("ja", "ko", "zh")):
+        cjk = "JP" if lang.startswith("ja") else "KR" if lang.startswith("ko") else "TC" if "hant" in lang else "SC"
+        fontpkg += (r"\usepackage{xeCJK}" + "\n"
+                    + r"\setCJKmainfont{Noto Serif CJK " + cjk + "}\n"
+                    + r"\setCJKsansfont{Noto Sans CJK " + cjk + "}\n"
+                    + r"\setCJKmonofont{Noto Sans CJK " + cjk + "}\n")
+
+
+    if lang.startswith(("ar", "fa")):
+        rtl_language = "farsi" if lang.startswith("fa") else "arabic"
+        # bidi must load after Sphinx's color, table, and hyperlink packages.
+        latex_elements["polyglossia"] = ""
+        preamble += (r"\usepackage{polyglossia}\setmainlanguage{" + rtl_language + r"}\setotherlanguage{english}")
+        preamble += r"""
+\usepackage{etoolbox}
+\BeforeBeginEnvironment{sphinxVerbatim}{\begin{LTR}}
+\AfterEndEnvironment{sphinxVerbatim}{\end{LTR}}
+\let\openshotoriginalcode\sphinxcode
+\renewcommand{\sphinxcode}[1]{\textenglish{\openshotoriginalcode{#1}}}
+"""
+        latex_elements["maketitle"] = (r"\release{\textenglish{" + config.release
+            + r"}}\title{\textenglish{OpenShot Video Editor Documentation}}"
+            + r"\author{\textenglish{OpenShot Studios, LLC}}\sphinxmaketitle")
+
+
+    latex_elements["fontpkg"] = fontpkg
+    latex_elements["preamble"] = preamble
+    config.latex_elements = latex_elements
+
+
+def _configure_html_context(app, config):
+    # Ensure custom values are available to templates after -D overrides.
+    html_context = dict(config.html_context or {})
+    html_context["ga4_measurement_id"] = config.ga4_measurement_id
+    config.html_context = html_context
+
+
+def _rewrite_shared_assets(app, exception):
+    if exception is not None:
+        return
+    if os.environ.get("OPENSHOT_SHARED_ASSETS") != "1":
+        return
+    lang = (app.config.language or "").lower()
+    if not lang or lang == "en":
+        return
+
+    local_scripts = ("translations.js", "documentation_options.js", "language_data.js")
+    preserved_scripts = {}
+    for name in local_scripts:
+        path = os.path.join(app.outdir, "_static", name)
+        if os.path.isfile(path):
+            with open(path, "rb") as handle:
+                preserved_scripts[name] = handle.read()
+
+    replacements = {
+        "_static/": "../_static/",
+        "_images/": "../_images/",
+        "_sources/": "../_sources/",
+        "_downloads/": "../_downloads/",
+    }
+    pattern = re.compile(r'(?<=["\'])(' + "|".join(map(re.escape, replacements.keys())) + r')')
+
+    for root, _, files in os.walk(app.outdir):
+        for name in files:
+            if not name.endswith(".html"):
+                continue
+            path = os.path.join(root, name)
+            with open(path, "r", encoding="utf-8") as handle:
+                data = handle.read()
+            def shared_path(match):
+                if match.group(1) == "_static/" and data[match.end():].startswith(local_scripts):
+                    return match.group(1)
+                return replacements[match.group(1)]
+            new_data = pattern.sub(shared_path, data)
+            if new_data != data:
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(new_data)
+
+    for shared in ("_static", "_images", "_sources", "_downloads", ".doctrees"):
+        target = os.path.join(app.outdir, shared)
+        if os.path.isdir(target):
+            for root, dirs, files in os.walk(target, topdown=False):
+                for fname in files:
+                    os.remove(os.path.join(root, fname))
+                for dname in dirs:
+                    os.rmdir(os.path.join(root, dname))
+            os.rmdir(target)
+
+    if preserved_scripts:
+        static_dir = os.path.join(app.outdir, "_static")
+        os.makedirs(static_dir, exist_ok=True)
+        for name, data in preserved_scripts.items():
+            with open(os.path.join(static_dir, name), "wb") as handle:
+                handle.write(data)
+
+
 # Grouping the document tree into LaTeX files. List of tuples
 # (source start file, target name, title,
 #  author, documentclass [howto, manual, or own class]).
 latex_documents = [
     (master_doc, 'OpenShotVideoEditor.tex', 'OpenShot Video Editor Documentation',
-     'Jonathan Thomas', 'manual'),
+     'OpenShot Studios, LLC', 'manual'),
 ]
 
 # The name of an image file (relative to this directory) to place at the top of
@@ -454,3 +619,72 @@ epub_exclude_files = ['search.html']
 # If false, no index is generated.
 #
 # epub_use_index = True
+
+def _fixed_rtl_pdf_tables(app, doctree, docname):
+    # Fixed-width tabular columns avoid bidi/tabulary measurement failures.
+    if app.builder.format == "latex" and (app.config.language or "").startswith(("ar", "fa")):
+        from docutils import nodes
+        for table in doctree.findall(nodes.table):
+            if "colwidths-given" not in table["classes"]:
+                table["classes"].append("colwidths-given")
+
+
+def _configure_bengali_latex(app):
+    if app.builder.format != "latex" or not (app.config.language or "").startswith("bn"):
+        return
+    from sphinx.writers.latex import LaTeXTranslator
+
+    # Scope fonts inside emphasis and headings; preserve legacy mixed-script text.
+    class BengaliFontTranslator(LaTeXTranslator):
+        def encode(self, text):
+            encoded = super().encode(text)
+            for pattern, font in [(r"[\u0980-\u09ff\u0964-\u0965]+", "bengalifont"),
+                                  (r"[\u0600-\u06ff]+", "openshotarabicfallback"),
+                                  (r"[\uac00-\ud7af]+", "openshotkoreanfallback")]:
+                encoded = re.sub(pattern, lambda m: "{\\" + font + " " + m.group() + "}", encoded)
+            return encoded
+
+    app.set_translator("latex", BengaliFontTranslator, override=True)
+
+
+def _wrap_hindi_latex_fonts(app, exception):
+    if exception is not None or app.builder.format != "latex" or not (app.config.language or "").startswith("hi"):
+        return
+    # Include generated captions, dates, and running headings as well as body text.
+    for name in ("OpenShotVideoEditor.tex", "sphinxmessages.sty"):
+        path = os.path.join(app.outdir, name)
+        with open(path, encoding="utf-8") as handle:
+            data = handle.read()
+        data = re.sub(r"[\u0900-\u097f\u1cd0-\u1cff]+", lambda m: r"{\devanagarifont " + m.group() + "}", data)
+        data = re.sub(r"[\u0980-\u09ff]+", lambda m: r"{\openshotbengalifallback " + m.group() + "}", data)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(data)
+
+
+def setup(app):
+    app.connect("build-finished", _wrap_hindi_latex_fonts)
+    app.connect("builder-inited", _configure_bengali_latex)
+    app.connect("doctree-resolved", _fixed_rtl_pdf_tables)
+    app.add_config_value("ga4_measurement_id", None, "env")
+    if hasattr(app, "add_css_file"):
+        app.add_css_file("lightbox.css")
+    else:
+        app.add_stylesheet("lightbox.css")
+    if hasattr(app, "add_js_file"):
+        app.add_js_file("lightbox.js")
+    else:
+        app.add_javascript("lightbox.js")
+
+    def _builder_configure_latex_fonts(app):
+        _configure_latex_fonts(app, app.config)
+
+    def _builder_configure_html_context(app):
+        _configure_html_context(app, app.config)
+
+    try:
+        app.connect("config-inited", _configure_latex_fonts)
+        app.connect("config-inited", _configure_html_context)
+    except Exception:
+        app.connect("builder-inited", _builder_configure_latex_fonts)
+        app.connect("builder-inited", _builder_configure_html_context)
+    app.connect("build-finished", _rewrite_shared_assets)

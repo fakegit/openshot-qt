@@ -31,21 +31,25 @@ import operator
 import functools
 import platform
 
-from PyQt5.QtCore import Qt, QSize, QDir
-from PyQt5.QtWidgets import (
-    QWidget, QDialog, QMessageBox, QFileDialog,
+from qt_api import Qt, QSize, QDir, minimum_ui_scale
+from qt_api import (
+    QWidget, QDialog, QMessageBox, QFileDialog, QDialogButtonBox,
     QVBoxLayout, QHBoxLayout, QSizePolicy,
     QScrollArea, QLabel, QLineEdit, QPushButton,
-    QDoubleSpinBox, QComboBox, QCheckBox, QSpinBox,
+    QDoubleSpinBox, QComboBox, QSpinBox, QStyle,
 )
-from PyQt5.QtGui import QKeySequence, QIcon
+from qt_api import QKeySequence, QIcon
 
-from classes import info, ui_util, settings
-from classes import openshot_rc  # noqa
+from classes import info, ui_util, tabstops
+from classes import hardware_rc, openshot_rc  # noqa
 from classes.app import get_app
+from classes.distribution import is_snap
 from classes.language import get_all_languages
 from classes.logger import log
 from classes.metrics import track_metric_screen
+from windows.toggle_switch import ToggleSwitch
+from windows.views.hardware_combo import (HardwareComboBox, set_hardware_item,
+                                          BADGE_WIDTH, BADGE_HEIGHT)
 
 import openshot
 
@@ -59,7 +63,7 @@ class Preferences(QDialog):
     def __init__(self):
 
         # Create dialog class
-        QDialog.__init__(self)
+        super().__init__()
 
         # Load UI from designer
         ui_util.load_ui(self, self.ui_path)
@@ -67,14 +71,20 @@ class Preferences(QDialog):
         # Init UI
         ui_util.init_ui(self)
 
+        # Define the custom category order
+        self.custom_order = ["General", "Timeline", "Preview", "Optimize", "Autosave", "Cache", "Performance", "Keyboard", "Location", "Advanced"]
+
         # Get settings
-        self.s = settings.get_settings()
+        self.s = get_app().get_settings()
 
         # Dynamically load tabs from settings data
-        self.settings_data = settings.get_settings().get_all_settings()
+        self.settings_data = self.s.get_all_settings()
 
         # Track metrics
         track_metric_screen("preferences-screen")
+
+        # Disable video caching
+        openshot.Settings.Instance().ENABLE_PLAYBACK_CACHING = False
 
         # Load all user values
         self.params = {}
@@ -82,8 +92,23 @@ class Preferences(QDialog):
             if "setting" in item and "value" in item:
                 self.params[item["setting"]] = item
 
-        # Connect search textbox
+        # Track widgets and dependencies between settings
+        self.setting_widgets = {}
+        self.dependency_map = {}
+
+        # Connect signals
         self.txtSearch.textChanged.connect(self.txtSearch_changed)
+        self.btnRestoreDefaults.clicked.connect(self.confirm_restore_defaults)
+        self.tabCategories.currentChanged.connect(self.category_tab_changed)
+
+        # Disable autoDefault so ENTER doesn't trigger Restore Defaults from random widgets
+        self.btnRestoreDefaults.setAutoDefault(False)
+        self.btnRestoreDefaults.setDefault(False)
+
+        # Make Close button the default so ENTER closes the dialog
+        close_button = self.buttonBox.button(QDialogButtonBox.Close)
+        if close_button:
+            close_button.setDefault(True)
 
         self.requires_restart = False
         self.category_names = {}
@@ -97,24 +122,43 @@ class Preferences(QDialog):
         # Populate preferences
         self.Populate()
 
-        # Restore normal cursor
-        get_app().restoreOverrideCursor()
+        # Highlight invalid keyboard shortcuts
+        self.check_shortcut_validity()
 
-    def txtSearch_changed(self):
+    def category_tab_changed(self, index):
+        """Update the Restore Defaults button label based on the selected tab."""
+        # Get the current widget for the selected tab
+        current_widget = self.tabCategories.widget(index)
+        if not current_widget:
+            return
+
+        # Retrieve the non-translated category using the object name
+        non_translated_category = current_widget.objectName()
+
+        # Update the Restore Defaults button label
+        if non_translated_category:
+            self.btnRestoreDefaults.setText(f"Restore Defaults: {non_translated_category}")
+
+        self._apply_tab_order()
+
+    def txtSearch_changed(self, *_args):
         """textChanged event handler for search box"""
-        log.info("Search for %s" % self.txtSearch.text())
+        log.info("Search for %s", self.txtSearch.text())
 
         # Populate preferences
         self.Populate(filter=self.txtSearch.text())
 
     def DeleteAllTabs(self, onlyInVisible=False):
-        """Delete all tabs"""
+        """Delete all tabs and ensure they are fully removed from memory."""
         for name, widget in dict(self.category_tabs).items():
+            # Check visibility condition
             if (onlyInVisible and name not in self.visible_category_names) or not onlyInVisible:
+                # Remove hidden widgets
                 parent_widget = widget.parent().parent()
-                parent_widget.parent().removeWidget(parent_widget)
+                parent_widget.setParent(None)
                 parent_widget.deleteLater()
 
+                # Clean up the references in the internal tracking dictionaries
                 if name in self.category_names:
                     self.category_names.pop(name)
                 if name in self.visible_category_names:
@@ -124,7 +168,6 @@ class Preferences(QDialog):
 
     def Populate(self, filter=""):
         """Populate all preferences and tabs"""
-
         # get translations
         app = get_app()
         _ = app._tr
@@ -134,50 +177,53 @@ class Preferences(QDialog):
 
         self.category_names = {}
         self.category_tabs = {}
-        self.category_sort = {}
         self.visible_category_names = {}
 
-        # Loop through settings and find all unique categories
+        # Reset widget/dependency trackers each time preferences are rebuilt
+        self.setting_widgets = {}
+        self.dependency_map = {}
+
+        # Loop through settings and collect categories
         for item in self.settings_data:
             category = item.get("category")
             setting_type = item.get("type")
-            sort_category = item.get("sort")
-
-            # Indicate sorted category
-            if sort_category:
-                self.category_sort[category] = sort_category
+            sort_type = item.get("sort")
 
             if setting_type != "hidden":
                 # Load setting
                 if category not in self.category_names:
                     self.category_names[category] = []
-
-                    # Create scrollarea
-                    scroll_area = QScrollArea(self)
-                    scroll_area.setWidgetResizable(True)
-                    scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-                    scroll_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-                    scroll_area.setMinimumSize(675, 100)
-
-                    # Create tab widget and layout
-                    layout = QVBoxLayout()
-                    tabWidget = QWidget(self)
-                    tabWidget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
-                    tabWidget.setLayout(layout)
-                    scroll_area.setWidget(tabWidget)
-
-                    # Add tab
-                    self.tabCategories.addTab(scroll_area, _(category))
-                    self.category_tabs[category] = tabWidget
-
-                # Append translated title
-                item["title_tr"] = _(item.get("title"))
+                if sort_type:
+                    self.category_sort[category] = sort_type
 
                 # Append settings into correct category
                 self.category_names[category].append(item)
 
-        # Loop through each category setting, and add them to the tabs
-        for category in dict(self.category_tabs).keys():
+        # Create tabs in the predefined order (only add categories present in settings_data)
+        for category in self.custom_order:
+            if category in self.category_names:
+                # Create scroll area
+                scroll_area = QScrollArea(self)
+                scroll_area.setWidgetResizable(True)
+                scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+                scroll_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                scroll_area.setMinimumSize(675, 100)
+
+                # Create tab widget and layout
+                layout = QVBoxLayout()
+                tabWidget = QWidget(self)
+                tabWidget.setObjectName("PreferencePanel")
+                tabWidget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+                tabWidget.setLayout(layout)
+                scroll_area.setWidget(tabWidget)
+                scroll_area.setObjectName(category)
+
+                # Add tab in the predefined order
+                self.tabCategories.addTab(scroll_area, _(category))
+                self.category_tabs[category] = tabWidget
+
+        # Now populate each tab with settings
+        for category in self.custom_order:
             tabWidget = self.category_tabs[category]
             filterFound = False
 
@@ -185,7 +231,7 @@ class Preferences(QDialog):
             params = self.category_names[category]
             if self.category_sort.get(category):
                 # Sort this category by translated title
-                params.sort(key=operator.itemgetter("title_tr"))
+                params.sort(key=lambda setting: _(setting.get("title")))
 
             # Loop through settings for each category
             for param in params:
@@ -208,68 +254,131 @@ class Preferences(QDialog):
                 label.setText(_(param["title"]))
                 label.setToolTip(_(param["title"]))
 
-                if param["type"] == "spinner":
+                if is_snap() and param.get("setting") in ("blender_command", "title_editor"):
+                    message = (_("Not available in Snap") if param["setting"] == "blender_command"
+                               else _("No path needed in Snap"))
+                    widget = QLabel(message)
+                    widget.setEnabled(False)
+
+                elif param["type"] == "spinner":
                     # create QDoubleSpinBox
                     widget = QDoubleSpinBox()
                     widget.setMinimum(float(param["min"]))
                     widget.setMaximum(float(param["max"]))
                     widget.setValue(float(param["value"]))
-                    widget.setSingleStep(1.0)
+                    widget.setSingleStep(param.get("step", 1.0))
                     widget.setToolTip(param["title"])
                     widget.valueChanged.connect(functools.partial(self.spinner_value_changed, param))
 
-                if param["type"] == "spinner-int":
+                elif param["type"] == "spinner-int":
                     # create QDoubleSpinBox
                     widget = QSpinBox()
-                    widget.setMinimum(int(param["min"]))
-                    widget.setMaximum(int(param["max"]))
-                    widget.setValue(int(param["value"]))
-                    widget.setSingleStep(1.0)
+                    min_value = int(param["min"])
+                    max_value = int(param["max"])
+                    current_value = int(param["value"])
+                    thread_limits = self._get_thread_spinner_limits(param.get("setting"))
+                    if thread_limits:
+                        min_value, max_value = thread_limits
+                        clamped_value = max(min_value, min(current_value, max_value))
+                        if clamped_value != current_value:
+                            self.s.set(param["setting"], clamped_value)
+                            param["value"] = clamped_value
+                            current_value = clamped_value
+                    widget.setMinimum(min_value)
+                    widget.setMaximum(max_value)
+                    widget.setValue(current_value)
+                    widget.setSingleStep(param.get("step", 1))
                     widget.setToolTip(param["title"])
+                    if param["setting"] == "auto-optimize-threshold":
+                        widget.setObjectName("auto-optimize-threshold")
+                        widget.setSuffix(_(" ms"))
+                        tooltip = _("Suggest or automatically optimize videos whose first thumbnail frame takes longer than this to generate. Lower values include more videos.")
+                        widget.setToolTip(tooltip)
+                        label.setToolTip(tooltip)
                     widget.valueChanged.connect(functools.partial(self.spinner_value_changed, param))
 
-                elif param["type"] == "text" or param["type"] == "browse":
+                elif param["type"] in ("text", "browse", "browse-folder"):
                     # create QLineEdit
                     widget = QLineEdit()
                     widget.setText(_(param["value"]))
+                    widget.setObjectName(param["setting"])
                     widget.textChanged.connect(functools.partial(self.text_value_changed, widget, param))
 
-                    if param["type"] == "browse":
+                    if param["type"] in ("browse", "browse-folder"):
                         # Add filesystem browser button
                         extraWidget = QPushButton(_("Browse..."))
-                        extraWidget.clicked.connect(functools.partial(self.selectExecutable, widget, param))
+                        callback = self.selectFolder if param["type"] == "browse-folder" else self.selectExecutable
+                        extraWidget.clicked.connect(functools.partial(callback, widget, param))
+                    elif param.get("setting") == "comfy-ui-url":
+                        # Add an explicit connectivity check for ComfyUI URL.
+                        extraWidget = QPushButton(_("Check"))
+                        extraWidget.clicked.connect(
+                            functools.partial(self.check_comfy_ui_url, widget, param, extraWidget)
+                        )
 
                 elif param["type"] == "bool":
-                    # create spinner
-                    widget = QCheckBox()
+                    widget = ToggleSwitch()
+                    widget.setAccessibleName(_(param["title"]))
+                    label.setBuddy(widget)
                     if param["value"] is True:
                         widget.setCheckState(Qt.Checked)
                     else:
                         widget.setCheckState(Qt.Unchecked)
+                    if param["setting"] in ("debug-ui", "debug-mode"):
+                        tooltip = self.logging_tooltip(param["setting"])
+                        widget.setToolTip(tooltip)
+                        label.setToolTip(tooltip)
                     widget.stateChanged.connect(functools.partial(self.bool_value_changed, widget, param))
 
                 elif param["type"] == "dropdown":
 
                     # create spinner
-                    widget = QComboBox()
+                    widget = HardwareComboBox() if param.get("setting") in ("hw-decoder", "gpu-mode") else QComboBox()
+                    if param.get("setting") in ("hw-decoder", "gpu-mode"):
+                        # Icon-bearing entries need extra vertical room.
+                        widget.setIconSize(QSize(BADGE_WIDTH, BADGE_HEIGHT))
+                        widget.setMinimumHeight(32)
+                    else:
+                        widget.setFixedHeight(28)
+                    widget.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
 
                     # Get values
                     value_list = param["values"]
+                    if param['setting'] == 'gpu-device':
+                        value_list = [{"value": "", "name": _("Automatic (recommended)")}]
+                        diagnostics = getattr(app, 'gpu_diagnostics', None)
+                        if diagnostics:
+                            value_list.extend({"value": d['name'], "name": d['name']}
+                                              for d in diagnostics.snapshot()['devices']
+                                              if d['type'] != 'software')
+                        saved = param['value']
+                        if saved and not any(v['value'] == saved for v in value_list):
+                            value_list.append({"value": saved, "name": saved})
+                        widget.setToolTip(_("GPU used for Vulkan video processing. Automatic is recommended. Restart OpenShot after changing this setting."))
+                    elif param['setting'] == 'gpu-mode':
+                        widget.setToolTip(_("Try GPU processing with Vulkan, or use CPU compatibility mode. Export encoding is selected separately. Restart OpenShot after changing this setting."))
                     # Overwrite value list (for profile dropdown)
                     if param["setting"] == "default-profile":
                         value_list = []
                         # Loop through profiles
                         for profile_folder in [info.USER_PROFILES_PATH, info.PROFILES_PATH]:
-                            for file in os.listdir(profile_folder):
+                            for file in reversed(sorted(os.listdir(profile_folder))):
                                 # Load Profile and append description
                                 profile_path = os.path.join(profile_folder, file)
+                                if os.path.isdir(profile_path):
+                                    continue
                                 profile = openshot.Profile(profile_path)
+                                profile_lbl = f"{profile.info.description} ({profile.info.width}x{profile.info.height})"
                                 value_list.append({
-                                    "name": profile.info.description,
+                                    "name": profile_lbl,
                                     "value": profile.info.description
                                     })
-                        # Sort profile list
-                        value_list.sort(key=operator.itemgetter("name"))
+
+                        # Add test button
+                        extraWidget = QPushButton()
+                        extraWidget.setToolTip(_("Search Profiles"))
+                        extraWidget.setIcon(QIcon(":/icons/Humanity/mimes/16/video-x-generic.svg"))
+                        extraWidget.clicked.connect(functools.partial(self.btnBrowseProfiles_clicked, widget))
 
                     # Overwrite value list (for audio device list dropdown)
                     if param["setting"] == "playback-audio-device":
@@ -277,11 +386,37 @@ class Preferences(QDialog):
                         # Loop through audio devices
                         value_list.append({"name": "Default", "value": ""})
                         for audio_device in get_app().window.preview_thread.player.GetAudioDeviceNames():
+                            # Text:  Type first, then device name  (i.e. "ALSA: PulseAudio Sound Server")
+                            # Value: Name first, ||, then device type  (i.e. "PulseAudio Sound Server||ALSA")
                             value_list.append({
-                                "name": "%s: %s" % (
-                                    audio_device.type, audio_device.name),
-                                "value": audio_device.name,
-                                })
+                                "name": "%s: %s" % (audio_device[1], audio_device[0]),
+                                "value": "%s||%s" % (audio_device[0], audio_device[1])
+                            })
+
+                    # Overwrite value list (for theme names)
+                    if param["setting"] == "theme":
+                        from themes.manager import ThemeName
+                        value_list = []
+                        for theme_name in ThemeName.get_sorted_theme_names():
+                            value_list.append({
+                                "name": _(theme_name), "value": theme_name
+                            })
+
+                    if param["setting"] == "ui-scale":
+                        minimum_scale = minimum_ui_scale()
+                        value_list = [item for item in value_list
+                                      if float(item["value"]) >= minimum_scale]
+                        current_scale = max(minimum_scale, min(3.0, float(param["value"])))
+                        has_current_value = any(
+                            abs(float(item.get("value", 0.0)) - current_scale) < 0.001
+                            for item in value_list
+                        )
+                        if not has_current_value:
+                            value_list.append({
+                                "name": _("%d%% (Custom)") % int(round(current_scale * 100)),
+                                "value": current_scale,
+                            })
+                            value_list.sort(key=lambda item: float(item.get("value", 0.0)))
 
                     # Overwrite value list (for language dropdown)
                     if param["setting"] == "default-language":
@@ -306,6 +441,9 @@ class Preferences(QDialog):
                     # Overwrite value list (for hardware acceleration modes)
                     os_platform = platform.system()
                     if param["setting"] == "hw-decoder":
+                        popup_view = widget.view()
+                        if hasattr(popup_view, "setSpacing"):
+                            popup_view.setSpacing(1)
                         for value_item in list(value_list):
                             v = value_item["value"]
                             # Remove items that are operating system specific
@@ -316,81 +454,71 @@ class Preferences(QDialog):
                             elif os_platform == "Linux" and v not in ("0", "1", "2", "6"):
                                 value_list.remove(value_item)
 
-                        # Remove hardware mode items which cannot decode the example video
-                        log.debug("Preparing to test hardware decoding: %s" % (value_list))
-                        for value_item in list(value_list):
-                            v = value_item["value"]
-                            if (not self.testHardwareDecode(value_list, v, 0)
-                               and not self.testHardwareDecode(value_list, v, 1)):
-                                value_list.remove(value_item)
-                        log.debug("Completed hardware decoding testing")
+                            # Add test button
+                            extraWidget = QPushButton(_("Test"))
+                            extraWidget.clicked.connect(functools.partial(self.testHardwareDecode, widget,
+                                                                          param, extraWidget))
 
                     # Replace %s dropdown values for hardware acceleration
                     if param["setting"] in ("graca_number_en", "graca_number_de"):
+                        value_list = []
                         for card_index in range(0, 3):
-                            # Test each graphics card, and only include valid ones
-                            if card_index in self.hardware_tests_cards and self.hardware_tests_cards.get(card_index):
-                                # Loop through valid modes supported by this card
-                                for mode in self.hardware_tests_cards.get(card_index):
-                                    # Add supported graphics card for each mode (duplicates are okay)
-                                    if mode == 0:
-                                        # cpu only
-                                        value_list.append({
-                                            "value": card_index,
-                                            "name": _("No acceleration"),
-                                            "icon": mode
-                                            })
-                                    else:
-                                        # hardware accelerated
-                                        value_list.append({
-                                            "value": card_index,
-                                            "name": _("Graphics Card %s") % (card_index + 1),
-                                            "icon": mode
-                                            })
-
-                        if os_platform in ["Darwin", "Windows"]:
-                            # Disable graphics card selection for Mac and Windows (since libopenshot
-                            # only supports device selection on Linux)
-                            widget.setEnabled(False)
-                            widget.setToolTip(_("Graphics card selection not supported in %s") % os_platform)
+                            # hardware accelerated
+                            value_list.append({
+                                "value": card_index,
+                                "name": _("Graphics Card %s") % card_index
+                            })
 
                     # Add normal values
                     box_index = 0
                     for value_item in value_list:
-                        k = value_item["name"]
-                        v = value_item["value"]
+                        k = value_item.get("name")
+                        v = value_item.get("value")
                         i = value_item.get("icon", None)
+
+                        # Translate dropdown item (if needed)
+                        if param.get("translate_values"):
+                            k = _(value_item["name"])
 
                         # Override icons for certain values
                         # TODO: Find a more elegant way to do this
                         icon = None
                         if k == "Linux VA-API" or i == 1:
-                            icon = QIcon(":/hw/hw-accel-vaapi.svg")
+                            icon = QIcon(":/hardware/gpu.svg")
                         elif k == "Nvidia NVDEC" or i == 2:
-                            icon = QIcon(":/hw/hw-accel-nvdec.svg")
+                            icon = QIcon(":/hardware/gpu.svg")
                         elif k == "Linux VDPAU" or i == 6:
-                            icon = QIcon(":/hw/hw-accel-vdpau.svg")
+                            icon = QIcon(":/hardware/gpu.svg")
                         elif k == "Windows D3D9" or i == 3:
-                            icon = QIcon(":/hw/hw-accel-dx.svg")
+                            icon = QIcon(":/hardware/gpu.svg")
                         elif k == "Windows D3D11" or i == 4:
-                            icon = QIcon(":/hw/hw-accel-dx.svg")
+                            icon = QIcon(":/hardware/gpu.svg")
                         elif k == "MacOS" or i == 5:
-                            icon = QIcon(":/hw/hw-accel-vtb.svg")
+                            icon = QIcon(":/hardware/gpu.svg")
                         elif k == "Intel QSV" or i == 7:
-                            icon = QIcon(":/hw/hw-accel-qsv.svg")
+                            icon = QIcon(":/hardware/gpu.svg")
                         elif k == "No acceleration" or i == 0:
-                            icon = QIcon(":/hw/hw-accel-none.svg")
+                            icon = QIcon(":/hardware/cpu.svg")
 
                         # add dropdown item
                         if icon:
-                            widget.setIconSize(QSize(60, 18))
+                            widget.setIconSize(QSize(64, 22))
                             widget.addItem(icon, _(k), v)
+                            if isinstance(widget, HardwareComboBox):
+                                mode = "cpu" if k == "No acceleration" or i == 0 else "gpu"
+                                set_hardware_item(widget, widget.count() - 1, mode)
                         else:
                             widget.addItem(_(k), v)
 
                         # select dropdown (if default)
-                        if v == param["value"]:
+                        if (
+                            param["setting"] == "ui-scale"
+                            and abs(float(v) - current_scale) < 0.001
+                        ) or v == param["value"]:
                             widget.setCurrentIndex(box_index)
+                        if param['setting'] == 'gpu-mode':
+                            set_hardware_item(widget, widget.count() - 1,
+                                              'cpu' if v == 'cpu' else 'gpu')
                         box_index = box_index + 1
 
                     widget.currentIndexChanged.connect(functools.partial(self.dropdown_index_changed, widget, param))
@@ -399,6 +527,8 @@ class Preferences(QDialog):
                 if (widget and label and filterFound):
                     # Add minimum size
                     label.setMinimumWidth(180)
+                    # Match combo-box rows, including text-only values.
+                    label.setMinimumHeight(28)
                     label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
                     widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
@@ -412,6 +542,7 @@ class Preferences(QDialog):
 
                     # Add widget to layout
                     tabWidget.layout().addLayout(layout_hbox)
+                    self.register_setting_widget(param, widget, label)
                 elif (label and filterFound):
                     # Add widget to layout
                     tabWidget.layout().addWidget(label)
@@ -419,8 +550,103 @@ class Preferences(QDialog):
             # Add stretch to bottom of layout
             tabWidget.layout().addStretch()
 
+        self.apply_all_dependencies()
+        self.update_gpu_preference_controls()
+
         # Delete all tabs and widgets
         self.DeleteAllTabs(onlyInVisible=True)
+
+        self._apply_tab_order()
+
+    def update_gpu_preference_controls(self):
+        mode = self.setting_widgets.get('gpu-mode')
+        device = self.setting_widgets.get('gpu-device')
+        if mode and device:
+            device.setEnabled(mode.currentData() != 'cpu')
+
+    def register_setting_widget(self, param, widget, label=None):
+        """Store widget references and register dependency relationships."""
+        setting_name = param.get("setting")
+        if not setting_name or not widget:
+            return
+
+        self.setting_widgets[setting_name] = widget
+        widget.setObjectName(setting_name)
+
+        dependency = param.get("dependency")
+        if dependency:
+            self.dependency_map.setdefault(dependency, []).append((widget, label))
+
+    def _apply_tab_order(self):
+        """Apply a stable tab order for the currently visible preferences tab."""
+        current_tab = self.tabCategories.currentWidget()
+        if not current_tab:
+            tabstops.apply_auto_tab_order_later(self)
+            return
+
+        content_widget = current_tab.widget()
+        if not content_widget:
+            tabstops.apply_auto_tab_order_later(self)
+            return
+
+        # Ensure the scroll area is part of the focus chain (Qt6 is stricter)
+        if current_tab.focusProxy() is None and content_widget is not None:
+            current_tab.setFocusProxy(content_widget)
+
+        ordered = [self.txtSearch, self.tabCategories, current_tab]
+        ordered.extend(
+            tabstops.collect_focusable_from_layout(
+                content_widget.layout(), self, include_hidden=True
+            )
+        )
+        ordered.extend([self.btnRestoreDefaults, self.buttonBox])
+
+        tabstops.apply_explicit_tab_order_later(
+            ordered, root=self, include_hidden=True
+        )
+
+    def apply_all_dependencies(self):
+        """Apply dependency state to all registered widgets."""
+        for setting_name in list(self.dependency_map.keys()):
+            self.apply_dependency_state(setting_name)
+
+    def apply_dependencies_for_controller(self, controller_setting):
+        """Apply dependency states linked to a specific controller setting."""
+        if not controller_setting:
+            return
+        for dependency_key in list(self.dependency_map.keys()):
+            setting_name = dependency_key[1:] if dependency_key.startswith("!") else dependency_key
+            if setting_name == controller_setting:
+                self.apply_dependency_state(dependency_key)
+
+    def apply_dependency_state(self, dependency_key):
+        """Enable/disable dependent widgets based on controller state.
+
+        A dependency key can be prefixed with "!" to invert the controller value.
+        """
+        controlled_widgets = self.dependency_map.get(dependency_key, [])
+        if not controlled_widgets:
+            return
+
+        invert = False
+        setting_name = dependency_key
+        if isinstance(dependency_key, str) and dependency_key.startswith("!"):
+            invert = True
+            setting_name = dependency_key[1:]
+
+        enabled = bool(self.s.get(setting_name))
+        if invert:
+            enabled = not enabled
+        for widget, label in controlled_widgets:
+            if widget:
+                widget.setEnabled(enabled)
+
+    def selectFolder(self, widget, param):
+        folder = QFileDialog.getExistingDirectory(
+            self, get_app()._tr("Select assets folder"),
+            self.s.get(param["setting"]) or info.HOME_PATH)
+        if folder:
+            widget.setText(folder)
 
     def selectExecutable(self, widget, param):
         _ = get_app()._tr
@@ -460,6 +686,64 @@ class Preferences(QDialog):
         if "restart" in param and param["restart"]:
             self.requires_restart = True
 
+    def _apply_timeline_track_size(self):
+        """Resize timeline tracks immediately when the preference changes."""
+        timeline_widget = getattr(get_app().window, "timeline", None)
+        if hasattr(timeline_widget, "set_track_size"):
+            timeline_widget.set_track_size(self.s.get("timeline-track-size"))
+
+    def _apply_timeline_thumbnail_style(self):
+        """Push the current thumbnail preference to the QWidget timeline."""
+        timeline_widget = getattr(get_app().window, "timeline", None)
+        if not hasattr(timeline_widget, "set_thumbnail_style"):
+            return
+        try:
+            timeline_widget.set_thumbnail_style(self.s.get("timeline-thumbnail-style"))
+        except Exception:
+            log.warning("Failed to apply timeline thumbnail style live", exc_info=1)
+
+    def _get_thread_spinner_limits(self, setting_name):
+        """Return UI bounds for thread-related preference spinners."""
+        lib_settings = openshot.Settings.Instance()
+        if setting_name == "omp_threads_number":
+            default_value = int(lib_settings.DefaultOMPThreads())
+            min_value = 2
+        elif setting_name == "ff_threads_number":
+            default_value = int(lib_settings.DefaultFFThreads())
+            min_value = 2
+        else:
+            return None
+
+        max_value = max(min_value, default_value * 3)
+        return min_value, max_value
+
+    def _apply_thread_settings(self):
+        """Apply current thread preference values to libopenshot."""
+        lib_settings = openshot.Settings.Instance()
+        omp_value = int(str(self.s.get("omp_threads_number")))
+        ff_value = int(str(self.s.get("ff_threads_number")))
+        omp_min, omp_max = self._get_thread_spinner_limits("omp_threads_number")
+        ff_min, ff_max = self._get_thread_spinner_limits("ff_threads_number")
+        lib_settings.OMP_THREADS = max(omp_min, min(omp_value, omp_max))
+        lib_settings.ApplyOpenMPSettings()
+        lib_settings.FF_THREADS = max(ff_min, min(ff_value, ff_max))
+
+    def _apply_cache_settings(self):
+        """Apply current cache preference values to the active session."""
+        get_app().window.InitCacheSettings()
+
+    def logging_tooltip(self, setting):
+        from classes import log_config
+        _ = get_app()._tr
+        if setting == "debug-ui":
+            description = _("Log interface details")
+            component = "python"
+        else:
+            description = _("Log video and audio details")
+            component = "native"
+        override = log_config.preference_description(self.s.get(setting), component)
+        return description + ("\n" + override if override else "")
+
     def bool_value_changed(self, widget, param, state):
         # Save setting
         if state == Qt.Checked:
@@ -468,13 +752,12 @@ class Preferences(QDialog):
             self.s.set(param["setting"], False)
 
         # Trigger specific actions
-        if param["setting"] == "debug-mode":
-            # Update debug setting of timeline
-            log.info("Setting debug-mode to %s" % (state == Qt.Checked))
-            debug_enabled = (state == Qt.Checked)
-
-            # Enable / Disable logger
-            openshot.ZmqLogger.Instance().Enable(debug_enabled)
+        if param["setting"] in ("debug-ui", "debug-mode"):
+            log.info("Setting %s to %s", param["setting"], state == Qt.Checked)
+            from classes import logger_libopenshot
+            logger_libopenshot.configure(
+                self.s.get("debug-mode"), ui_debug=self.s.get("debug-ui"))
+            widget.setToolTip(self.logging_tooltip(param["setting"]))
 
         elif param["setting"] == "enable-auto-save":
             # Toggle autosave
@@ -488,6 +771,10 @@ class Preferences(QDialog):
         # Check for restart
         self.check_for_restart(param)
 
+        # Update any dependent widgets
+        if param.get("setting"):
+            self.apply_dependencies_for_controller(param["setting"])
+
     def spinner_value_changed(self, param, value):
         # Save setting
         self.s.set(param["setting"], value)
@@ -498,10 +785,17 @@ class Preferences(QDialog):
             get_app().window.auto_save_timer.setInterval(int(value * 1000 * 60))
 
         elif param["setting"] == "omp_threads_number":
-            openshot.Settings.Instance().OMP_THREADS = max(2, int(str(value)))
+            lib_settings = openshot.Settings.Instance()
+            value = int(str(value))
+            min_value, max_value = self._get_thread_spinner_limits("omp_threads_number")
+            lib_settings.OMP_THREADS = max(min_value, min(value, max_value))
+            lib_settings.ApplyOpenMPSettings()
 
         elif param["setting"] == "ff_threads_number":
-            openshot.Settings.Instance().FF_THREADS = int(str(value))
+            lib_settings = openshot.Settings.Instance()
+            value = int(str(value))
+            min_value, max_value = self._get_thread_spinner_limits("ff_threads_number")
+            lib_settings.FF_THREADS = max(min_value, min(value, max_value))
 
         elif param["setting"] == "decode_hw_max_width":
             openshot.Settings.Instance().DE_LIMIT_WIDTH_MAX = int(str(value))
@@ -510,7 +804,9 @@ class Preferences(QDialog):
             openshot.Settings.Instance().DE_LIMIT_HEIGHT_MAX = int(str(value))
 
         # Apply cache settings (if needed)
-        if param["setting"] in ["cache-limit-mb", "cache-scale", "cache-quality"]:
+        if param["setting"] in ["cache-limit-mb", "cache-scale", "cache-quality",
+                                "cache-ahead-percent", "cache-preroll-min-frames",
+                                "cache-preroll-max-frames", "cache-max-frames"]:
             get_app().window.InitCacheSettings()
 
         # Check for restart
@@ -527,21 +823,130 @@ class Preferences(QDialog):
         # If this setting is a keyboard mapping, parse it first
         if param.get("category") == "Keyboard":
             previous_value = value
-            value = QKeySequence(value).toString()
-            log.info("Parsing keyboard mapping via QKeySequence from %s to %s" % (previous_value, value))
+
+            # Split the input value by the '|' delimiter
+            key_sequences = value.split('|')
+
+            # Parse each sequence part and re-join them with ' | ' after parsing
+            parsed_sequences = [QKeySequence(seq).toString() for seq in key_sequences]
+
+            # Join the parsed sequences back with ' | '
+            value = ' | '.join(parsed_sequences)
+            log.info("Parsing keyboard mapping via QKeySequence from %s to %s", previous_value, value)
 
         # Save setting
         self.s.set(param["setting"], value)
         log.info(value)
 
+        # Reload shortcuts (if needed)
+        if param.get("category") == "Keyboard":
+            get_app().window.initShortcuts()
+
+            # Check for duplicates and update UI feedback
+            self.check_shortcut_validity()
+
         # Check for restart
         self.check_for_restart(param)
+
+    def check_comfy_ui_url(self, widget, param, btn=None):
+        _ = get_app()._tr
+        if btn and btn.property("comfy_check_pending"):
+            return
+        url = str(widget.text() or "").strip().rstrip("/")
+        if not url:
+            log.info("ComfyUI URL check failed: empty URL")
+            self._update_comfy_ui_check_button(
+                btn,
+                available=False,
+                tooltip=_("ComfyUI URL is empty."),
+                enabled=True,
+            )
+            return
+
+        # Persist normalized URL before validation.
+        self.s.set(param["setting"], url)
+        widget.setText(url)
+        self._update_comfy_ui_check_button(
+            btn,
+            available=False,
+            tooltip=_("Checking ComfyUI connection..."),
+            enabled=True,
+            clear_icon=True,
+            pending=True,
+        )
+
+        window = getattr(get_app(), "window", None)
+        if not window:
+            self._update_comfy_ui_check_button(
+                btn,
+                available=False,
+                tooltip=_("Connection failed."),
+                enabled=True,
+                pending=False,
+            )
+            return
+
+        def _handle_result(available, error_text, checked_url):
+            try:
+                current_url = str(widget.text() or "").strip().rstrip("/")
+                if checked_url != current_url:
+                    self._update_comfy_ui_check_button(
+                        btn,
+                        available=False,
+                        tooltip=_("ComfyUI URL changed. Click Check to validate the new value."),
+                        enabled=True,
+                        clear_icon=True,
+                        pending=False,
+                    )
+                    return
+                if available:
+                    self._update_comfy_ui_check_button(
+                        btn,
+                        available=True,
+                        tooltip=_("Connection successful. AI menus are enabled."),
+                        enabled=True,
+                        pending=False,
+                    )
+                    return
+
+                message = _("Connection failed: {}").format(error_text) if error_text else _("Connection failed.")
+                self._update_comfy_ui_check_button(
+                    btn,
+                    available=False,
+                    tooltip="{} {}".format(
+                        message,
+                        _("AI menus are disabled until ComfyUI is reachable."),
+                    ),
+                    enabled=True,
+                    pending=False,
+                )
+            except RuntimeError:
+                return
+
+        window.refresh_comfy_availability_async(timeout=2.0, callback=_handle_result)
+
+    def _update_comfy_ui_check_button(self, btn, available, tooltip, enabled, clear_icon=False, pending=None):
+        if not btn:
+            return
+        if clear_icon:
+            btn.setIcon(QIcon())
+        else:
+            icon = self.style().standardIcon(
+                QStyle.SP_DialogApplyButton if available else QStyle.SP_DialogCancelButton
+            )
+            btn.setIcon(icon)
+        btn.setToolTip(str(tooltip or ""))
+        btn.setEnabled(bool(enabled))
+        if pending is not None:
+            btn.setProperty("comfy_check_pending", bool(pending))
 
     def dropdown_index_changed(self, widget, param, index):
         # Save setting
         value = widget.itemData(index)
         self.s.set(param["setting"], value)
         log.info(value)
+        if param['setting'] == 'gpu-mode':
+            self.update_gpu_preference_controls()
 
         # Apply cache settings (if needed)
         if param["setting"] in ["cache-mode", "cache-image-format"]:
@@ -557,72 +962,205 @@ class Preferences(QDialog):
         if param["setting"] == "graca_number_en":
             openshot.Settings.Instance().HW_EN_DEVICE_SET = int(value)
 
+        if param["setting"] == "theme":
+            # Apply selected theme to UI
+            if get_app().theme_manager:
+                get_app().theme_manager.apply_theme(value)
+
+        if param["setting"] == "timeline-thumbnail-style":
+            self._apply_timeline_thumbnail_style()
+        if param["setting"] == "timeline-track-size":
+            self._apply_timeline_track_size()
+
         # Check for restart
         self.check_for_restart(param)
 
-    def testHardwareDecode(self, all_decoders, decoder, decoder_card="0"):
-        """Test specific settings for hardware decode, so the UI can remove unsupported options."""
-        is_supported = False
-        example_media = os.path.join(info.RESOURCES_PATH, "hardware-example.mp4")
-        decoder_name = next(item for item in all_decoders if item["value"] == str(decoder)).get("name", "Unknown")
+    def btnBrowseProfiles_clicked(self, widget):
+        """Search profile button clicked"""
+        # Get current selection profile object
+        profile_description = widget.currentData()
 
-        # Persist decoder card results
-        if decoder_card not in self.hardware_tests_cards:
-            # Init new decoder card list
-            self.hardware_tests_cards[decoder_card] = []
-        if int(decoder) in self.hardware_tests_cards.get(decoder_card):
-            # Test already run and succeeded
-            return True
+        # Find matching profile path
+        matching_profile_path = None
+        for profile_folder in [info.USER_PROFILES_PATH, info.PROFILES_PATH]:
+            for file in reversed(sorted(os.listdir(profile_folder))):
+                # Load Profile and append description
+                matching_profile_path = os.path.join(profile_folder, file)
+                if os.path.isdir(matching_profile_path):
+                    continue
+                profile = openshot.Profile(matching_profile_path)
+                if profile.info.description == profile_description:
+                    break
+
+        # Load matching profile
+        current_profile = openshot.Profile(matching_profile_path)
+
+        # Show dialog (init to current selection)
+        from windows.profile import Profile
+        log.debug("Showing profile dialog")
+        win = Profile(current_profile.Key())
+        # Run the dialog event loop - blocking interaction on this window during this time
+        result = win.exec_()
+
+        profile = win.selected_profile
+        if result == QDialog.Accepted and profile:
+
+            # select the project's current profile
+            profile_index = self.getVideoProfileIndex(widget, profile)
+            if profile_index != -1:
+                # Re-select project profile (if found in list)
+                widget.setCurrentIndex(profile_index)
+            else:
+                # Previous profile not in list, so
+                # default to first profile in list
+                widget.setCurrentIndex(0)
+
+    def getVideoProfileIndex(self, widget, profile):
+        """Get the index of a profile name or profile key (-1 if not found)"""
+        for index in range(widget.count()):
+            combo_profile_description = widget.itemData(index)
+            if profile.info.description == combo_profile_description:
+                return index
+        return -1
+
+    def testHardwareDecode(self, widget, param, btn):
+        """Test specific settings for hardware decode"""
+        all_decoders = param.get("values", [])
+        is_supported = False
 
         # Keep track of previous settings
         current_decoder = openshot.Settings.Instance().HARDWARE_DECODER
         current_decoder_card = openshot.Settings.Instance().HW_DE_DEVICE_SET
-        current_decoder_name = next(
-            item for item in all_decoders
-            if item["value"] == str(current_decoder)
-            ).get("name", "Unknown")
-        log.debug(
-            "Current hardware decoder: %s (%s-%s)",
+        current_decoder_name = next(item for item in all_decoders
+                                    if item["value"] == str(current_decoder)).get("name", "Unknown")
+        log.debug("Testing hardware decoder: %s (Decoder Type: %s, Graphics Card: %s)",
             current_decoder_name, current_decoder, current_decoder_card)
 
         try:
-            # Temp override hardware settings (to test them)
-            log.debug(
-                "Testing hardware decoder: %s (%s-%s)",
-                decoder_name, decoder, decoder_card)
-            openshot.Settings.Instance().HARDWARE_DECODER = int(decoder)
-            openshot.Settings.Instance().HW_DE_DEVICE_SET = int(decoder_card)
-
             # Find reader
+            example_media = os.path.join(info.RESOURCES_PATH, "hardware-example.mp4")
             clip = openshot.Clip(example_media)
             reader = clip.Reader()
 
             # Open reader
             reader.Open()
 
-            # Test decoded pixel values for a valid decode (based on hardware-example.mp4)
-            if reader.GetFrame(0).CheckPixel(0, 0, 2, 133, 255, 255, 5):
+            # Test decoded pixel values for a valid decode. For hardware-backed
+            # options, also require that the reader actually produced a hardware
+            # decoded frame instead of silently falling back to software decode.
+            pixel_ok = reader.GetFrame(1).CheckPixel(0, 0, 2, 133, 255, 255, 5)
+            hardware_ok = current_decoder == 0 or reader.HardwareDecodeSuccessful()
+            if pixel_ok and hardware_ok:
                 is_supported = True
-                self.hardware_tests_cards[decoder_card].append(int(decoder))
-                log.debug("Successful hardware decoder! %s (%s-%s)" % (decoder_name, decoder, decoder_card))
+                log.debug("Successful test of hardware decoder: %s (Decoder Type: %s, Graphics Card: %s)",
+                          current_decoder_name, current_decoder, current_decoder_card)
             else:
-                log.debug(
-                    "CheckPixel failed testing hardware decoding (i.e. wrong color found): %s (%s-%s)",
-                    (decoder_name, decoder, decoder_card))
+                log.debug("Failed test of hardware decoder (incorrect pixel color or software fallback used): "
+                          "%s (Decoder Type: %s, Graphics Card: %s)",
+                          current_decoder_name, current_decoder, current_decoder_card)
 
             reader.Close()
             clip.Close()
 
-        except Exception:
-            log.debug(
-                "Exception trying to test hardware decoding (this is expected): %s (%s-%s)",
-                (decoder_name, decoder, decoder_card))
+        except Exception as ex:
+            log.debug("Exception testing hardware decoder: %s (Decoder Type: %s, Graphics Card: %s) %s",
+                      current_decoder_name, current_decoder, current_decoder_card, str(ex))
 
-        # Resume current settings
-        openshot.Settings.Instance().HARDWARE_DECODER = current_decoder
-        openshot.Settings.Instance().HW_DE_DEVICE_SET = current_decoder_card
+        # Show icon on test button (checkmark vs X)
+        icon_name = "SP_DialogApplyButton"
+        if not is_supported:
+            icon_name = "SP_DialogCancelButton"
+        pixmapi = getattr(QStyle, icon_name)
+        icon = self.style().standardIcon(pixmapi)
+        btn.setIcon(icon)
 
         return is_supported
+
+    def confirm_restore_defaults(self):
+        """Prompt the user for confirmation before restoring defaults for the current tab."""
+        # Get the current tab index and widget
+        current_index = self.tabCategories.currentIndex()
+        current_widget = self.tabCategories.widget(current_index)
+
+        # Retrieve the non-translated category using the object name
+        category = current_widget.objectName()
+
+        # Prompt the user for confirmation using named placeholders in the translation
+        _ = get_app()._tr
+        reply = QMessageBox.question(
+            self,
+            _('Restore Defaults').format(category=category),
+            _('Restore default values for {category}?').format(category=category),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        # If the user confirms, restore the settings for the current category
+        if reply == QMessageBox.Yes:
+            # Restore category settings
+            self.requires_restart = self.s.restore(category_filter=category)
+            self.settings_data = self.s.get_all_settings()
+
+            if category == "Performance":
+                self._apply_thread_settings()
+                self._apply_cache_settings()
+            elif category == "Cache":
+                self._apply_cache_settings()
+            elif category == "Timeline":
+                self._apply_timeline_track_size()
+
+            # Re-apply thumbnail style to the QWidget timeline if it changed
+            self._apply_timeline_thumbnail_style()
+
+            # Repopulate preferences
+            self.Populate()
+            self.tabCategories.setCurrentIndex(current_index)
+
+            # Update shortcuts on main window
+            get_app().window.initShortcuts()
+
+            # Highlight invalid keyboard shortcuts
+            self.check_shortcut_validity()
+
+    def check_shortcut_validity(self):
+        """Check all keyboard settings for duplicate or invalid shortcuts and update the UI."""
+
+        # Set to track all key sequences and prevent duplication
+        used_shortcuts = {}
+
+        # Iterate over all keyboard shortcuts from the application settings
+        for shortcut in get_app().window.getAllKeyboardShortcuts():
+            method_name = shortcut.get('setting')
+
+            # Get list of key sequences (divided by | delimiter)
+            shortcut_sequences = get_app().window.getShortcutByName(method_name)
+
+            # Create QKeySequence list for each sequence
+            key_sequences = [QKeySequence(seq).toString() for seq in shortcut_sequences if seq]
+
+            for key_sequence in key_sequences:
+                if key_sequence in used_shortcuts:
+                    # Mark both current and new shortcut as duplicates
+                    used_shortcuts[key_sequence]['is_duplicate'] = True
+                    used_shortcuts[key_sequence]['params'].append(method_name)
+                else:
+                    used_shortcuts[key_sequence] = {'is_duplicate': False, 'params': [method_name]}
+
+        # Update the UI based on shortcut validation
+        self.update_shortcut_visual_feedback(used_shortcuts)
+
+    def update_shortcut_visual_feedback(self, shortcut_map):
+        """Update the UI to provide feedback for duplicated/invalid shortcuts."""
+
+        for key_sequence, info in shortcut_map.items():
+            for param_name in info['params']:
+                # Find the QLineEdit using the objectName (which is set to the param name)
+                widget = self.findChild(QLineEdit, param_name)
+
+                if widget:
+                    if info['is_duplicate']:
+                        # Mark the field with red text and border for duplicates
+                        widget.setStyleSheet("color: red;")
 
     def closeEvent(self, event):
         """Signal for closing Preferences window"""
@@ -630,6 +1168,9 @@ class Preferences(QDialog):
         self.reject()
 
     def reject(self):
+        # Enable video caching
+        openshot.Settings.Instance().ENABLE_PLAYBACK_CACHING = True
+
         # Prompt user to restart openshot (if needed)
         if self.requires_restart:
             msg = QMessageBox()

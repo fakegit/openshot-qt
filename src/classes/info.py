@@ -5,7 +5,7 @@
 
  @section LICENSE
 
- Copyright (c) 2008-2018 OpenShot Studios, LLC
+ Copyright (c) 2008-2026 OpenShot Studios, LLC
  (http://www.openshotstudios.com). This file is part of
  OpenShot Video Editor (http://www.openshot.org), an open-source project
  dedicated to delivering high quality video editing and animation solutions
@@ -26,29 +26,38 @@
  """
 
 import os
+import sys
+import tempfile
 from time import strftime
 
-VERSION = "2.5.1-dev2"
-MINIMUM_LIBOPENSHOT_VERSION = "0.2.5"
-DATE = "20200228000000"
+VERSION = "4.2.0-dev1"
+MINIMUM_LIBOPENSHOT_VERSION = "1.2.0"
+DATE = "20261104000000"
 NAME = "openshot-qt"
 PRODUCT_NAME = "OpenShot Video Editor"
 GPL_VERSION = "3"
-DESCRIPTION = "Create and edit stunning videos, movies, and animations"
+DESCRIPTION = "Create and edit stunning videos, films, and animations with an " \
+              "easy-to-use interface and rich set of features."
 COMPANY_NAME = "OpenShot Studios, LLC"
-COPYRIGHT = "Copyright (c) 2008-{} {}".format(strftime("%Y"), COMPANY_NAME)
+COPYRIGHT = "(c) 2008-{} {}".format(strftime("%Y"), COMPANY_NAME)
 CWD = os.getcwd()
 
 # Application paths
-PATH = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))  # Primary openshot folder
+# Windows/Linux assets sit by the executable. Mac assets follow classes under lib,
+# then under Resources after the DMG builder moves and symlinks that directory.
+PATH = (os.path.dirname(os.path.abspath(sys.executable))
+        if getattr(sys, "frozen", False) and sys.platform != "darwin"
+        else os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 RESOURCES_PATH = os.path.join(PATH, "resources")
 PROFILES_PATH = os.path.join(PATH, "profiles")
 IMAGES_PATH = os.path.join(PATH, "images")
 EXPORT_PRESETS_PATH = os.path.join(PATH, "presets")
+COLORS_PATH = os.path.join(PATH, "colors")
 
 # User paths
 HOME_PATH = os.path.join(os.path.expanduser("~"))
 USER_PATH = os.path.join(HOME_PATH, ".openshot_qt")
+ASSETS_PATH = USER_PATH
 BACKUP_PATH = os.path.join(USER_PATH)
 RECOVERY_PATH = os.path.join(USER_PATH, "recovery")
 THUMBNAIL_PATH = os.path.join(USER_PATH, "thumbnail")
@@ -61,20 +70,99 @@ PREVIEW_CACHE_PATH = os.path.join(USER_PATH, "preview-cache")
 USER_PROFILES_PATH = os.path.join(USER_PATH, "profiles")
 USER_PRESETS_PATH = os.path.join(USER_PATH, "presets")
 USER_TITLES_PATH = os.path.join(USER_PATH, "title_templates")
+COMFYUI_PATH = os.path.join(USER_PATH, "comfyui")
+COMFYUI_OUTPUT_PATH = os.path.join(USER_PATH, "comfyui-output")
+USER_COLORS_PATH = os.path.join(USER_PATH, "colors")
 PROTOBUF_DATA_PATH = os.path.join(USER_PATH, "protobuf_data")
+YOLO_PATH = os.path.join(USER_PATH, "yolo")
+CLIPBOARD_PATH = os.path.join(USER_PATH, "clipboard")
+PROXY_PATH = os.path.join(USER_PATH, "optimized")
 # User files
 BACKUP_FILE = os.path.join(BACKUP_PATH, "backup.osp")
-USER_DEFAULT_PROJECT = os.path.join(USER_PATH, "default.project")
+USER_DEFAULT_PROJECT = os.path.join(USER_PATH, "default.osp")
+LEGACY_DEFAULT_PROJECT = USER_DEFAULT_PROJECT.replace(".osp", ".project")
 
-# Create user paths if they do not exist
-# (this is where temp files are stored... such as cached thumbnails)
-for folder in [
-    USER_PATH, BACKUP_PATH, RECOVERY_PATH, THUMBNAIL_PATH, CACHE_PATH,
-    BLENDER_PATH, TITLE_PATH, TRANSITIONS_PATH, PREVIEW_CACHE_PATH,
-    USER_PROFILES_PATH, USER_PRESETS_PATH, USER_TITLES_PATH, EMOJIS_PATH,
-    PROTOBUF_DATA_PATH ]:
-    if not os.path.exists(os.fsencode(folder)):
-        os.makedirs(folder, exist_ok=True)
+# Back up "default" values for user paths
+_path_defaults = {
+    k: v for k, v in locals().items()
+    if k.endswith("_PATH")
+    and v.startswith(USER_PATH)
+}
+
+# Only project assets follow the unsaved assets preference. Settings, caches,
+# recovery files, templates, and downloaded tools remain in USER_PATH.
+_asset_folders = {
+    "THUMBNAIL_PATH": "thumbnail",
+    "TITLE_PATH": "title",
+    "BLENDER_PATH": "blender",
+    "PROTOBUF_DATA_PATH": "protobuf_data",
+    "CLIPBOARD_PATH": "clipboard",
+    "COMFYUI_OUTPUT_PATH": "comfyui-output",
+    "PROXY_PATH": "optimized",
+}
+
+
+def _check_assets_folder(path):
+    """Create and check a writable directory without touching existing files."""
+    os.makedirs(path, exist_ok=True)
+    with tempfile.TemporaryFile(dir=path):
+        pass
+
+
+def default_assets_path():
+    """Choose the Linux Snap-accessible default, retaining the legacy fallback."""
+    videos = os.path.join(HOME_PATH, "Videos")
+    if sys.platform.startswith("linux") and os.path.isdir(videos):
+        candidate = os.path.join(videos, ".openshot-tmp")
+        try:
+            _check_assets_folder(candidate)
+            return candidate
+        except OSError:
+            pass
+    return USER_PATH
+
+
+def set_assets_path(path):
+    """Retarget active project assets without changing the unsaved defaults."""
+    global ASSETS_PATH
+    ASSETS_PATH = path
+    for name, folder in _asset_folders.items():
+        globals()[name] = os.path.join(path, folder)
+
+
+def configure_asset_defaults(path):
+    """Apply the startup preference, falling back if it cannot be used."""
+    path = os.path.abspath(os.path.expanduser(path or USER_PATH))
+    try:
+        _check_assets_folder(path)
+        for folder in _asset_folders.values():
+            _check_assets_folder(os.path.join(path, folder))
+    except OSError:
+        path = USER_PATH
+        for folder in _asset_folders.values():
+            os.makedirs(os.path.join(path, folder), exist_ok=True)
+    set_assets_path(path)
+    for name in ("ASSETS_PATH", *_asset_folders):
+        _path_defaults[name] = globals()[name]
+    return path
+
+
+try:
+    from qt_api import QSize
+
+    # UI Thumbnail settings
+    LIST_ICON_SIZE = QSize(100, 65)
+    LIST_GRID_SIZE = LIST_ICON_SIZE + QSize(5, 25)
+    TREE_ICON_SIZE = QSize(75, 49)
+    EMOJI_ICON_SIZE = QSize(75, 75)
+    EMOJI_GRID_SIZE = EMOJI_ICON_SIZE + QSize(5, 25)
+    # Runtime emoji selections
+    EMOJI_FILES = {}
+    EMOJI_PATH = ""
+    EMOJI_ICON = ""
+except ImportError:
+    # Fail gracefully if we're running without Qt (e.g. CI tasks)
+    print("Failed to import `qt_api.QSize` (ignoring exception)")
 
 # Maintainer details, for packaging
 JT = {"name": "Jonathan Thomas",
@@ -85,17 +173,32 @@ JT = {"name": "Jonathan Thomas",
 DESKTOP_ID = "org.openshot.OpenShot.desktop"
 
 # Blender minimum version required (a string value)
-BLENDER_MIN_VERSION = "2.80"
+BLENDER_MIN_VERSION = "5.0"
 
 # Data-model debugging enabler
 MODEL_TEST = False
+FEEDBACK_PREVIEW = False  # Launch-only preview; never stored in user settings.
+UPDATE_PREVIEW = False
 
 # Default/initial logging levels
 LOG_LEVEL_FILE = 'INFO'
 LOG_LEVEL_CONSOLE = 'INFO'
 
-# Web backend selection, overridable at launch
-WEB_BACKEND = 'auto'
+# Sentry.io error & transaction reporting rate (0.0 TO 1.0)
+# 0.0 = no error reporting to Sentry
+# 0.5 = 1/2 of errors reported to Sentry
+# 1.0 = all errors reporting to Sentry
+#    ERROR: Exceptions sent to Sentry
+#    TRANS: Transactions sent to Sentry
+#    STABLE: If both version and build commit match the current published release
+#    UNSTABLE: Older versions, different builds, or unconfirmed releases
+#    STABLE_VERSION: This is the current stable release reported by openshot.org
+ERROR_REPORT_RATE_STABLE = 0.0
+ERROR_REPORT_RATE_UNSTABLE = 0.0
+TRANS_REPORT_RATE_STABLE = 0.0
+TRANS_REPORT_RATE_UNSTABLE = 0.0
+ERROR_REPORT_STABLE_VERSION = None
+ERROR_REPORT_IS_RELEASE = False
 
 # Languages
 CMDLINE_LANGUAGE = None
@@ -108,11 +211,11 @@ try:
 except ImportError:
     language_path = os.path.join(PATH, 'language')
     print("Compiled translation resources missing!")
-    print("Loading translations from: {}".format(language_path))
+    print(f"Loading translations from: {language_path}")
 
 # Compile language list from :/locale resource
 try:
-    from PyQt5.QtCore import QDir
+    from qt_api import QDir
     langdir = QDir(language_path)
     trpaths = langdir.entryList(
         ['OpenShot_*.qm'],
@@ -123,8 +226,8 @@ try:
         lang=trpath[trpath.find('_')+1:-3]
         SUPPORTED_LANGUAGES.append(lang)
 except ImportError:
-    # Fail gracefully if we're running without PyQt5 (e.g. CI tasks)
-    pass
+    # Fail gracefully if we're running without Qt (e.g. CI tasks)
+    print("Failed to import `qt_api.QDir` (ignoring exception)")
 
 SETUP = {
     "name": NAME,
@@ -167,11 +270,42 @@ SETUP = {
 
     # Automatic launch script creation
     "entry_points": {
+        "console_scripts": ["openshot-cli = openshot_qt.cli:main"],
         "gui_scripts": [
             "openshot-qt = openshot_qt.launch:main"
         ]
     }
 }
+
+def setup_userdirs():
+    """Create user paths if they do not exist (this is where
+    temp files are stored... such as cached thumbnails)"""
+    for folder in _path_defaults.values():
+        if not os.path.exists(os.fsencode(folder)):
+            os.makedirs(folder, exist_ok=True)
+
+    # Migrate USER_DEFAULT_PROJECT from former name
+    if all([
+        os.path.exists(LEGACY_DEFAULT_PROJECT),
+        not os.path.exists(USER_DEFAULT_PROJECT),
+    ]):
+        print("Migrating default project file to new name")
+        os.rename(LEGACY_DEFAULT_PROJECT, USER_DEFAULT_PROJECT)
+
+
+def reset_userdirs():
+    """Reset all info.FOO_PATH attributes back to their initial values,
+    as they may have been modified by the runtime code (retargeting
+    info.THUMBNAIL_PATH to a project assets directory, for example)"""
+    for k, v in _path_defaults.items():
+        globals()[k] = v
+
+
+def get_default_path(varname):
+    """Return the default value of the named info.FOO_PATH attribute,
+    even if it's been modified"""
+    return _path_defaults.get(varname, None)
+
 
 def website_language():
     """Get the current website language code for URLs"""

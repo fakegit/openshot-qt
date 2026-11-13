@@ -24,21 +24,24 @@
  You should have received a copy of the GNU General Public License
  along with OpenShot Library.  If not, see <http://www.gnu.org/licenses/>.
  """
-
-import os
 import copy
+import json
+import os
 
+import openshot
+
+from classes.waveform_cache import externalize
 from classes import info
 from classes.app import get_app
-
-
-# Get project data reference
-app = get_app()
-project = app.project
+from classes.path_utils import absolute_media_path, media_paths_equal
 
 
 class QueryObject:
     """ This class allows one or more project data objects to be queried """
+
+    # Cache detached project objects per update version
+    _cache_version = None
+    _cache = {}
 
     def __init__(self):
         """ Constructor """
@@ -52,22 +55,24 @@ class QueryObject:
     def save(self, OBJECT_TYPE):
         """ Save the object back to the project data store """
 
+        externalize(self.data)
+
         # Insert or Update this data into the project data store
         if not self.id and self.type == "insert":
 
             # Insert record, and Generate id
-            self.id = project.generate_id()
+            self.id = get_app().project.generate_id()
 
             # save id in data (if attribute found)
-            self.data["id"] = copy.deepcopy(self.id)
+            self.data["id"] = json.loads(json.dumps(self.id))
 
             # Set key (if needed)
             if not self.key:
-                self.key = copy.deepcopy(OBJECT_TYPE.object_key)
+                self.key = json.loads(json.dumps(OBJECT_TYPE.object_key))
                 self.key.append({"id": self.id})
 
             # Insert into project data
-            app.updates.insert(copy.deepcopy(OBJECT_TYPE.object_key), copy.deepcopy(self.data))
+            get_app().updates.insert(json.loads(json.dumps(OBJECT_TYPE.object_key)), json.loads(json.dumps(self.data)))
 
             # Mark record as 'update' now... so another call to this method won't insert it again
             self.type = "update"
@@ -75,7 +80,7 @@ class QueryObject:
         elif self.id and self.type == "update":
 
             # Update existing project data
-            app.updates.update(self.key, self.data)
+            get_app().updates.update(self.key, self.data)
 
     def delete(self, OBJECT_TYPE):
         """ Delete the object from the project data store """
@@ -83,7 +88,7 @@ class QueryObject:
         # Delete if object found and not pending insert
         if self.id and self.type == "update":
             # Delete from project data store
-            app.updates.delete(self.key)
+            get_app().updates.delete(self.key)
             self.type = "delete"
 
     def title(self):
@@ -91,11 +96,31 @@ class QueryObject:
         # Needs to be overwritten in each derived class
         return None
 
+    @classmethod
+    def _get_cached_child(cls, OBJECT_TYPE, child):
+        """Return a cached, detached copy of child, clearing cache when project changes"""
+        updates = get_app().updates
+        current_version = getattr(updates, "data_version", 0)
+
+        if cls._cache_version != current_version:
+            cls._cache = {}
+            cls._cache_version = current_version
+
+        object_cache = cls._cache.setdefault(OBJECT_TYPE.object_name, {})
+        child_id = child.get("id")
+
+        # Cache deep copies by id; reuse within the same project version
+        cached = object_cache.get(child_id)
+        if cached is None:
+            cached = copy.deepcopy(child)
+            object_cache[child_id] = cached
+        return cached
+
     def filter(OBJECT_TYPE, **kwargs):
         """ Take any arguments given as filters, and find a list of matching objects """
 
         # Get a list of all objects of this type
-        parent = project.get(OBJECT_TYPE.object_key)
+        parent = get_app().project.get(OBJECT_TYPE.object_key)
 
         if not parent:
             return []
@@ -130,7 +155,7 @@ class QueryObject:
                 object = OBJECT_TYPE()
                 object.id = child["id"]
                 object.key = [OBJECT_TYPE.object_name, {"id": object.id}]
-                object.data = copy.deepcopy(child)  # copy of object
+                object.data = QueryObject._get_cached_child(OBJECT_TYPE, child)
                 object.type = "update"
                 matching_objects.append(object)
 
@@ -156,6 +181,30 @@ class Clip(QueryObject):
 
     def save(self):
         """ Save the object back to the project data store """
+        if isinstance(self.data, dict) and ("direct_text" in self.data
+                                            or any(key.startswith("text_") for key in self.data)):
+            from classes.direct_text import TEXT_ANIMATED, initialize_text_curves
+            # Query objects share a mutable query cache; compare with the actual
+            # project record so edits made in Properties are detected reliably.
+            old = get_app().project.get(["clips", {"id": self.id}]) if self.id else None
+            if self.data.get("direct_text") or (old and old.get("direct_text")):
+                asset_update = self.data.pop("_text_asset_update", False)
+                merged = copy.deepcopy(old or {})
+                merged.update(copy.deepcopy(self.data))
+                overrides = set(merged.get("text_style_overrides", []))
+                if old and not asset_update:
+                    for key in TEXT_ANIMATED:
+                        prop = "text_" + key
+                        if prop in self.data and self.data[prop] != old.get(prop):
+                            overrides.add(key)
+                merged["text_style_overrides"] = sorted(overrides)
+                initialize_text_curves(merged)
+                self.data["text_style_overrides"] = merged["text_style_overrides"]
+                self.data["reader"] = merged["reader"]
+                for key in TEXT_ANIMATED:
+                    prop = "text_" + key
+                    if prop in self.data or not old or prop not in old:
+                        self.data[prop] = merged[prop]
         super().save(Clip)
 
     def delete(self):
@@ -172,8 +221,17 @@ class Clip(QueryObject):
 
     def title(self):
         """ Get the translated display title of this item """
+        if self.data.get("direct_text"):
+            return self.data.get("title") or "Text"
         path = self.data.get("reader", {}).get("path")
-        return os.path.basename(path)
+        file_id = self.data.get("file_id") or self.data.get("reader", {}).get("id")
+        if file_id:
+            file = File.get(id=file_id)
+            if file:
+                name = str(file.data.get("name", "")).strip()
+                if name:
+                    return name
+        return os.path.basename(path) if path else (self.data.get("title") or "")
 
 class Transition(QueryObject):
     """ This class allows Transitions (i.e. timeline effects) to be queried, updated, and deleted from the project data. """
@@ -199,6 +257,8 @@ class Transition(QueryObject):
     def title(self):
         """ Get the translated display title of this item """
         path = self.data.get("reader", {}).get("path")
+        if not path:
+            return None
         fileBaseName = os.path.splitext(os.path.basename(path))[0]
 
         # split the name into parts (looking for a number)
@@ -237,35 +297,57 @@ class File(QueryObject):
 
     def get(**kwargs):
         """ Take any arguments given as filters, and find the first matching object """
-        return QueryObject.get(File, **kwargs)
+        file_path = kwargs.pop("path", None)
+        if file_path is None:
+            return QueryObject.get(File, **kwargs)
+
+        matching_objects = QueryObject.filter(File, **kwargs)
+        for obj in matching_objects:
+            if media_paths_equal(obj.data.get("path"), file_path):
+                return obj
+        return None
 
     def absolute_path(self):
         """ Get absolute file path of file """
 
-        # Get project folder (if any)
-        project_folder = None
-        if project.current_filepath:
-            project_folder = os.path.dirname(project.current_filepath)
-
-        # Convert relative file path into absolute (if needed)
-        file_path = self.data["path"]
-        if not os.path.isabs(file_path) and project_folder:
-            file_path = os.path.abspath(os.path.join(project_folder, self.data["path"]))
-
-        # Return absolute path of file
-        return file_path
+        file_path = self.data.get("path")
+        resolved = absolute_media_path(file_path)
+        if resolved:
+            return resolved
+        return file_path or ""
 
     def relative_path(self):
         """ Get relative path (based on the current working directory) """
 
-        # Get absolute file path
         file_path = self.absolute_path()
-
         # Convert path to relative (based on current working directory of Python)
-        file_path = os.path.relpath(file_path, info.CWD)
+        return os.path.relpath(file_path, info.CWD)
 
-        # Return relative path
-        return file_path
+    def profile(self):
+        """ Get the profile of the file """
+        # Load file Json into Profile object
+        file_profile = openshot.Profile()
+        file_profile.SetJson(json.dumps(self.data))
+
+        if file_profile.info.display_ratio.num == 1 and file_profile.info.display_ratio.den == 1:
+            # Some audio / image files have inaccurate DAR - calculate from size and pixel ratio
+            file_profile.info.display_ratio = openshot.Fraction(round(file_profile.info.width * file_profile.info.pixel_ratio.ToFloat()), file_profile.info.height)
+            file_profile.info.display_ratio.Reduce()
+
+        # Iterate through all possible profiles
+        for profile_folder in [info.USER_PROFILES_PATH, info.PROFILES_PATH]:
+            for file in reversed(sorted(os.listdir(profile_folder))):
+                profile_path = os.path.join(profile_folder, file)
+                if os.path.isdir(profile_path):
+                    continue
+                try:
+                    # Load Profile
+                    profile = openshot.Profile(profile_path)
+                    if profile == file_profile:
+                        return profile
+                except RuntimeError as e:
+                    pass
+        return file_profile
 
 
 class Marker(QueryObject):
@@ -311,6 +393,12 @@ class Track(QueryObject):
         """ Take any arguments given as filters, and find the first matching object """
         return QueryObject.get(Track, **kwargs)
 
+    def __lt__(self, other):
+        return self.data.get('number', 0) < other.data.get('number', 0)
+
+    def __gt__(self, other):
+        return self.data.get('number', 0) > other.data.get('number', 0)
+
 
 class Effect(QueryObject):
     """ This class allows Effects to be queried, updated, and deleted from the project data. """
@@ -329,7 +417,7 @@ class Effect(QueryObject):
         """ Take any arguments given as filters, and find a list of matching objects """
 
         # Get a list of clips
-        clips = project.get("clips")
+        clips = get_app().project.get("clips")
         matching_objects = []
 
         # Loop through all clips
@@ -351,7 +439,7 @@ class Effect(QueryObject):
                             object = Effect()
                             object.id = child["id"]
                             object.key = ["clips", {"id": clip["id"]}, "effects", {"id": object.id}]
-                            object.data = child
+                            object.data = json.loads(json.dumps(child))
                             object.type = "update"
                             object.parent = clip
                             matching_objects.append(object)

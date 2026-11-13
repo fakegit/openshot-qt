@@ -27,13 +27,11 @@
 
 import os
 
-from PyQt5.QtCore import (
+from qt_api import (
     QObject, QMimeData, Qt, QSize, pyqtSignal,
-    QSortFilterProxyModel, QPersistentModelIndex, QItemSelectionModel,
+    QSortFilterProxyModel, QPersistentModelIndex, QItemSelectionModel, QItemSelection, QModelIndex,
 )
-from PyQt5.QtGui import QIcon, QPixmap, QStandardItemModel, QStandardItem
-from PyQt5.QtWidgets import QMessageBox
-
+from qt_api import QIcon, QPixmap, QStandardItemModel, QStandardItem
 import openshot  # Python module for libopenshot (required video editing module installed separately)
 
 from classes import info
@@ -43,16 +41,66 @@ from classes.app import get_app
 import json
 
 
+class SingleColumnProxyModel(QSortFilterProxyModel):
+    """Proxy that exposes only the first column for ListView accessibility"""
+
+    def columnCount(self, parent=QModelIndex()):
+        return 1
+
+    def data(self, index, role=Qt.DisplayRole):
+        """Get text data from the underlying source model (bypassing filter proxy)"""
+        if index.column() == 0 and role in (Qt.DisplayRole, Qt.AccessibleTextRole):
+            source_index = self.mapToSource(index)
+            filter_proxy = self.sourceModel()
+            if filter_proxy:
+                root_index = filter_proxy.mapToSource(source_index)
+                root_model = filter_proxy.sourceModel()
+                if root_model:
+                    return root_model.data(root_index, Qt.DisplayRole)
+        return super().data(index, role)
+
+
 class EffectsProxyModel(QSortFilterProxyModel):
     def __init__(self, parent=None):
         super().__init__(parent=parent)
+
+    def data(self, index, role=Qt.DisplayRole):
+        """Hide text in column 0 for TreeView - name is shown in column 1"""
+        if index.column() == 0 and role in (Qt.DisplayRole, Qt.AccessibleTextRole):
+            return ""
+        return super().data(index, role)
+
+    def filterAcceptsRow(self, sourceRow, sourceParent):
+        """Filter for common transitions and text filter"""
+
+        if not get_app().window.actionEffectsShowAll.isChecked():
+            # Fetch the effect values
+            effect_name = self.sourceModel().data(self.sourceModel().index(sourceRow, 1, sourceParent))
+            effect_desc = self.sourceModel().data(self.sourceModel().index(sourceRow, 2, sourceParent))
+            effect_type = self.sourceModel().data(self.sourceModel().index(sourceRow, 3, sourceParent))
+
+            # Return, if regExp match in displayed format.
+            if get_app().window.actionEffectsShowVideo.isChecked():
+                return effect_type == "Video" and \
+                    (self.filterRegExp().indexIn(effect_name) >= 0 or
+                     self.filterRegExp().indexIn(effect_desc) >= 0)
+            else:
+                return effect_type == "Audio" and \
+                    (self.filterRegExp().indexIn(effect_name) >= 0 or
+                     self.filterRegExp().indexIn(effect_desc) >= 0)
+
+        # Continue running built-in parent filter logic
+        return super(EffectsProxyModel, self).filterAcceptsRow(sourceRow, sourceParent)
 
     def mimeData(self, indexes):
         # Create MimeData for drag operation
         data = QMimeData()
 
         # Get list of class names for requested effect indexes
-        items = [i.sibling(i.row(), 4).data() for i in indexes]
+        items = []
+        for proxy_index in indexes:
+            source_index = self.mapToSource(proxy_index)
+            items.append(source_index.sibling(source_index.row(), 4).data())
         data.setText(json.dumps(items))
         data.setHtml("effect")
 
@@ -102,18 +150,8 @@ class EffectsModel(QObject):
                 category = "Audio & Video"
             elif not effect_info["has_video"] and effect_info["has_audio"]:
                 category = "Audio"
-                icon_path = os.path.join(icons_dir, "audio.png")
             elif effect_info["has_video"] and not effect_info["has_audio"]:
                 category = "Video"
-
-            # Filter out effect (if needed)
-            if (
-                win.effectsFilter.text() != ""
-                and win.effectsFilter.text().lower() not in self.app._tr(title).lower()
-                and win.effectsFilter.text().lower() not in self.app._tr(description).lower()
-            ):
-                continue
-
 
             # Check for thumbnail path (in build-in cache)
             thumb_path = os.path.join(info.IMAGES_PATH, "cache", icon_name)
@@ -145,23 +183,22 @@ class EffectsModel(QObject):
 
                 except Exception:
                     # Handle exception
-                    log.info('Invalid effect image file: %s' % icon_path)
-                    msg = QMessageBox()
-                    msg.setText(_("{} is not a valid image file.".format(icon_path)))
-                    msg.exec_()
-                    continue
+                    log.warning("{} is not a valid image file.".format(icon_path))
 
             row = []
 
             # Append thumbnail
             col = QStandardItem()
 
-            icon_pixmap = QPixmap(thumb_path)
-            scaled_pixmap = icon_pixmap.scaled(QSize(98, 64), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-            col.setIcon(QIcon(scaled_pixmap))
+            # Load icon (using display DPI)
+            icon = QIcon()
+            icon.addFile(thumb_path)
+
+            col.setIcon(icon)
             col.setText(self.app._tr(title))
             col.setToolTip(self.app._tr(title))
             col.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsUserCheckable | Qt.ItemIsDragEnabled)
+            col.setAccessibleText(self.app._tr(title))
             row.append(col)
 
             # Append Name
@@ -169,6 +206,7 @@ class EffectsModel(QObject):
             col.setData(self.app._tr(title), Qt.DisplayRole)
             col.setText(self.app._tr(title))
             col.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsUserCheckable | Qt.ItemIsDragEnabled)
+            col.setAccessibleText(self.app._tr(title))
             row.append(col)
 
             # Append Description
@@ -199,6 +237,42 @@ class EffectsModel(QObject):
         # Emit signal when model is updated
         self.ModelRefreshed.emit()
 
+    def _sync_tree_to_list_selection(self, selected, deselected):
+        """Sync selection from TreeView (proxy_model) to ListView (list_proxy_model)"""
+        if self._syncing_selection:
+            return
+        self._syncing_selection = True
+        try:
+            list_selection = QItemSelection()
+            for index in self.selection_model.selectedRows(0):
+                list_index = self.list_proxy_model.mapFromSource(index)
+                if list_index.isValid():
+                    list_selection.select(list_index, list_index)
+            self.list_selection_model.select(
+                list_selection,
+                QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows
+            )
+        finally:
+            self._syncing_selection = False
+
+    def _sync_list_to_tree_selection(self, selected, deselected):
+        """Sync selection from ListView (list_proxy_model) to TreeView (proxy_model)"""
+        if self._syncing_selection:
+            return
+        self._syncing_selection = True
+        try:
+            tree_selection = QItemSelection()
+            for index in self.list_selection_model.selectedRows(0):
+                tree_index = self.list_proxy_model.mapToSource(index)
+                if tree_index.isValid():
+                    tree_selection.select(tree_index, tree_index)
+            self.selection_model.select(
+                tree_selection,
+                QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows
+            )
+        finally:
+            self._syncing_selection = False
+
     def __init__(self, *args):
         # Init QObject superclass
         super().__init__(*args)
@@ -209,23 +283,34 @@ class EffectsModel(QObject):
         self.model.setColumnCount(5)
         self.model_names = {}
 
-        # Create proxy model (for sorting and filtering)
+        # Create proxy model (for sorting and filtering) - used by TreeView
         self.proxy_model = EffectsProxyModel()
-        self.proxy_model.setDynamicSortFilter(False)
+        self.proxy_model.setDynamicSortFilter(True)
         self.proxy_model.setFilterCaseSensitivity(Qt.CaseInsensitive)
         self.proxy_model.setSortCaseSensitivity(Qt.CaseSensitive)
         self.proxy_model.setSourceModel(self.model)
         self.proxy_model.setSortLocaleAware(True)
+        self.proxy_model.setFilterKeyColumn(-1)
 
-        # Create selection model to share between views
+        # Create single-column proxy for ListView (wraps proxy_model for accessibility)
+        self.list_proxy_model = SingleColumnProxyModel()
+        self.list_proxy_model.setSourceModel(self.proxy_model)
+
+        # Create selection models for each view
         self.selection_model = QItemSelectionModel(self.proxy_model)
+        self.list_selection_model = QItemSelectionModel(self.list_proxy_model)
+
+        # Sync selections between the two selection models
+        self._syncing_selection = False
+        self.selection_model.selectionChanged.connect(self._sync_tree_to_list_selection)
+        self.list_selection_model.selectionChanged.connect(self._sync_list_to_tree_selection)
 
         # Attempt to load model testing interface, if requested
         # (will only succeed with Qt 5.11+)
         if info.MODEL_TEST:
             try:
                 # Create model tester objects
-                from PyQt5.QtTest import QAbstractItemModelTester
+                from qt_api import QAbstractItemModelTester
                 self.model_tests = []
                 for m in [self.proxy_model, self.model]:
                     self.model_tests.append(

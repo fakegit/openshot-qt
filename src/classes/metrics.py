@@ -27,42 +27,50 @@
 
 # idna encoding import required to prevent bug (unknown encoding: idna)
 import encodings.idna
-import requests
+import base64
 import platform
 import threading
 import time
-import urllib.parse
-from copy import deepcopy
+
 from classes import info
+from classes import http_client
 from classes import language
+from classes.app import get_app
 from classes.logger import log
-from classes import settings
+
 import openshot
 
-from PyQt5.QtCore import QT_VERSION_STR
-from PyQt5.QtCore import PYQT_VERSION_STR
+from qt_api import QTimer, QT_VERSION_STR, PYQT_VERSION_STR
+from functools import partial
+
+try:
+    import distro
+except ModuleNotFoundError:
+    distro = None
 
 # Get settings
-s = settings.get_settings()
+s = get_app().get_settings()
 
 # Determine OS version
 os_version = "X11; Linux %s" % platform.machine()
-linux_distro = "None"
+os_distro = "None"
 try:
     if platform.system() == "Darwin":
         v = platform.mac_ver()
         os_version = "Macintosh; Intel Mac OS X %s" % v[0].replace(".", "_")
-        linux_distro = "OS X %s" % v[0]
+        os_distro = "OS X %s" % v[0]
 
     elif platform.system() == "Windows":
         v = platform.win32_ver()
-        # TODO: Upgrade windows python (on build server) version to 3.5, so it correctly identifies Windows 10
         os_version = "Windows NT %s; %s" % (v[0], v[1])
-        linux_distro = "Windows %s" % "-".join(platform.win32_ver())
+        os_distro = "Windows %s" % "-".join(v)
 
     elif platform.system() == "Linux":
         # Get the distro name and version (if any)
-        linux_distro = "-".join(platform.linux_distribution())
+        if distro:
+            os_distro = "-".join(distro.linux_distribution()[0:2])
+        else:
+            os_distro = "Linux"
 
 except Exception:
     log.debug("Error determining OS version", exc_info=1)
@@ -70,135 +78,165 @@ except Exception:
 # Build user-agent
 user_agent = "Mozilla/5.0 (%s) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/37.0.2062.120 Safari/537.36" % os_version
 
-params = {
-    "cid": s.get("unique_install_id"),      # Unique install ID
-    "v": 1,                                 # Google Measurement API version
-    "tid": "UA-4381101-5",                  # Google Analytic Tracking ID
-    "an": info.PRODUCT_NAME,                # App Name
-    "aip": 1,                               # Anonymize IP
-    "aid": "org.openshot.%s" % info.NAME,   # App ID
-    "av": info.VERSION,                     # App Version
-    "ul": language.get_current_locale().replace('_', '-').lower(),   # Current Locale
-    "ua": user_agent,                       # Custom User Agent (for OS, Processor, and OS version)
-    "cd1": openshot.OPENSHOT_VERSION_FULL,  # Dimension 1: libopenshot version
-    "cd2": platform.python_version(),       # Dimension 2: python version (i.e. 3.4.3)
-    "cd3": QT_VERSION_STR,                  # Dimension 3: qt5 version (i.e. 5.2.1)
-    "cd4": PYQT_VERSION_STR,                # Dimension 4: pyqt5 version (i.e. 5.2.1)
-    "cd5": linux_distro
-}
+GA4_ENDPOINT = "https://www.google-analytics.com/mp/collect"
+GA4_MID = "G-YGF4YGWPE2"
+GA4_MPS = "aG9qVmV0MllURXVPMlVoQm11RWRDQQ=="
+GA4_SESSION_ID = int(time.time())
+METRIC_QUEUE_MAX = 100
+METRIC_CONNECT_TIMEOUT = http_client.DEFAULT_CONNECT_TIMEOUT
+METRIC_READ_TIMEOUT = 3
 
 # Queue for metrics (incase things are disabled... just queue it up
 # incase the user enables metrics later
 metric_queue = []
+metric_queue_lock = threading.Lock()
+metric_worker_active = False
+
+
+def _d(value):
+    """Decode a stored string value."""
+    return base64.b64decode(value.encode("ascii")).decode("ascii")
+
+
+def _base_event_params():
+    """Shared GA4 params for all events (used as custom dimensions)."""
+    return {
+        "engagement_time_msec": 1,
+        "session_id": GA4_SESSION_ID,
+        "os_app_name": info.PRODUCT_NAME,
+        "os_app_version": info.VERSION,
+        "os_libopenshot_version": openshot.OPENSHOT_VERSION_FULL,
+        "os_python_version": platform.python_version(),
+        "os_qt_version": QT_VERSION_STR,
+        "os_pyqt_version": PYQT_VERSION_STR,
+        "os_locale": language.get_current_locale().replace('_', '-').lower(),
+        "os_platform": os_version,
+        "os_distro": os_distro,
+    }
+
+
+def _build_event(name, extra_params=None):
+    """Build a GA4 event payload."""
+    event_params = _base_event_params()
+    if extra_params:
+        event_params.update(extra_params)
+    return {
+        "name": name,
+        "params": event_params,
+    }
+
 
 def track_metric_screen(screen_name):
     """Track a GUI screen being shown"""
-    metric_params = deepcopy(params)
-    metric_params["t"] = "screenview"
-    metric_params["cd"] = screen_name
-    metric_params["cid"] = s.get("unique_install_id")
-
-    t = threading.Thread(target=send_metric, args=[metric_params])
-    t.daemon = True
-    t.start()
+    event = _build_event("screen_view", {"screen_name": screen_name})
+    QTimer.singleShot(0, partial(send_metric, event))
 
 
 def track_metric_event(event_action, event_label, event_category="General", event_value=0):
-    """Track a GUI screen being shown"""
-    metric_params = deepcopy(params)
-    metric_params["t"] = "event"
-    metric_params["ec"] = event_category
-    metric_params["ea"] = event_action
-    metric_params["el"] = event_label
-    metric_params["ev"] = event_value
-    metric_params["cid"] = s.get("unique_install_id")
-
-    t = threading.Thread(target=send_metric, args=[metric_params])
-    t.daemon = True
-    t.start()
+    """Track a UI event."""
+    event = _build_event(
+        "ui_event",
+        {
+            "event_category": event_category,
+            "event_action": event_action,
+            "event_label": event_label,
+            "value": event_value,
+        },
+    )
+    QTimer.singleShot(0, partial(send_metric, event))
 
 
 def track_metric_error(error_name, is_fatal=False):
     """Track an error has occurred"""
-    metric_params = deepcopy(params)
-    metric_params["t"] = "exception"
-    metric_params["exd"] = error_name
-    metric_params["exf"] = 0
-    if is_fatal:
-        metric_params["exf"] = 1
-
-    t = threading.Thread(target=send_metric, args=[metric_params])
-    t.daemon = True
-    t.start()
-
-
-def track_exception_stacktrace(stacktrace, source):
-    """Track an exception/stacktrace has occurred"""
-    t = threading.Thread(target=send_exception, args=[stacktrace, source])
-    t.daemon = True
-    t.start()
+    event = _build_event(
+        "exception",
+        {
+            "description": error_name,
+            "fatal": 1 if is_fatal else 0,
+        },
+    )
+    QTimer.singleShot(0, partial(send_metric, event))
 
 
 def track_metric_session(is_start=True):
-    """Track a GUI screen being shown"""
-    metric_params = deepcopy(params)
-    metric_params["t"] = "screenview"
-    metric_params["sc"] = "start"
-    metric_params["cd"] = "launch-app"
-    metric_params["cid"] = s.get("unique_install_id")
-    if not is_start:
-        metric_params["sc"] = "end"
-        metric_params["cd"] = "close-app"
-
-    t = threading.Thread(target=send_metric, args=[metric_params])
-    t.daemon = True
-    t.start()
+    """Track application session start/end."""
+    event_name = "session_start" if is_start else "session_end"
+    event = _build_event(event_name, {"screen_name": "launch-app" if is_start else "close-app"})
+    QTimer.singleShot(0, partial(send_metric, event))
 
 
-def send_metric(params):
-    """Send anonymous metric over HTTP for tracking"""
+def send_metric(event):
+    """Send anonymous GA4 Measurement Protocol events over HTTP."""
+    global metric_worker_active
 
     # Add to queue and *maybe* send if the user allows it
-    metric_queue.append(params)
+    with metric_queue_lock:
+        metric_queue.append(event)
+        if len(metric_queue) > METRIC_QUEUE_MAX:
+            metric_queue.pop(0)
 
     # Check if the user wants to send metrics and errors
-    if s.get("send_metrics"):
+    if not s.get("send_metrics"):
+        return
+    if not GA4_MID or not GA4_MPS:
+        log.warning("GA4 metrics disabled: missing GA4 configuration")
+        return
 
-        for metric_params in metric_queue:
-            url_params = urllib.parse.urlencode(metric_params)
-            url = "http://www.google-analytics.com/collect?%s" % url_params
+    with metric_queue_lock:
+        if metric_worker_active:
+            return
+        metric_worker_active = True
 
-            # Send metric HTTP data
-            try:
-                r = requests.get(url, headers={"user-agent": user_agent}, verify=False)
-                log.info("Track metric: [%s] %s | (%s bytes)" % (r.status_code, r.url, len(r.content)))
-
-            except Exception as ex:
-                log.warning("Failed to track metric", exc_info=1)
-
-            # Wait a moment, so we don't spam the requests
-            time.sleep(0.25)
-
-        # All metrics have been sent (or attempted to send)
-        # Clear the queue
-        metric_queue.clear()
+    worker = threading.Thread(target=_send_metric_worker, name="OpenShotMetrics", daemon=True)
+    worker.start()
 
 
-def send_exception(stacktrace, source):
-    """Send exception stacktrace over HTTP for tracking"""
-    # Check if the user wants to send metrics and errors
-    if s.get("send_metrics"):
+def _send_metric_worker():
+    """Flush queued metrics without blocking the Qt event loop."""
+    global metric_worker_active
 
-        data = urllib.parse.urlencode({"stacktrace": stacktrace,
-                                       "platform": platform.system(),
-                                       "version": info.VERSION,
-                                       "source": source,
-                                       "unique_install_id": s.get("unique_install_id")})
-        url = "http://www.openshot.org/exception/json/"
+    while True:
+        with metric_queue_lock:
+            if not metric_queue:
+                metric_worker_active = False
+                return
 
-        # Send exception HTTP data
+            events_to_send = list(metric_queue)
+            metric_queue.clear()
+
+        url = "%s?measurement_id=%s&api_secret=%s" % (
+            GA4_ENDPOINT,
+            GA4_MID,
+            _d(GA4_MPS),
+        )
+        payload = {
+            "client_id": s.get("unique_install_id"),
+            "events": events_to_send,
+        }
+
         try:
-            r = requests.post(url, data=data, headers={"user-agent": user_agent, "content-type": "application/x-www-form-urlencoded"}, verify=False)
-            log.info("Track exception: [%s] %s | %s", r.status_code, r.url, r.text)
+            http_client.post_json(
+                url,
+                payload,
+                "metrics",
+                headers={"user-agent": user_agent},
+                timeout=(METRIC_CONNECT_TIMEOUT, METRIC_READ_TIMEOUT),
+            )
         except Exception:
-            log.warning("Failed to track exception", exc_info=1)
+            log.warning("Failed to track metric", exc_info=1)
+            _requeue_metrics(events_to_send)
+            return
+
+        # Wait in the worker so startup/UI rendering never blocks on telemetry.
+        time.sleep(0.25)
+
+
+def _requeue_metrics(events):
+    """Put failed metrics back in the bounded queue for a later attempt."""
+    global metric_worker_active
+
+    with metric_queue_lock:
+        metric_queue[:0] = events
+        if len(metric_queue) > METRIC_QUEUE_MAX:
+            del metric_queue[:-METRIC_QUEUE_MAX]
+        metric_worker_active = False

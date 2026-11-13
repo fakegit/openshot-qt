@@ -26,18 +26,24 @@
  """
 
 import os
+import copy
 from collections import OrderedDict
 from operator import itemgetter
 
-from PyQt5.QtCore import QMimeData, Qt, QLocale, QTimer
-from PyQt5.QtGui import (
+from qt_api import QMimeData, Qt, QLocale, QTimer
+from qt_api import (
     QStandardItemModel, QStandardItem,
-    QPixmap, QColor,
+    QPixmap, QColor, QBrush,
     )
 
+from classes.keyframe_editing import auto_keyframes_enabled, edit_frame, retarget_keyframe_changes, is_keyframe_patch
+from classes.waveform import get_audio_data
 from classes import info, updates
 from classes import openshot_rc  # noqa
-from classes.query import Clip, Transition, Effect
+from classes.clip_utils import (
+    clamp_timing_to_media, clip_time_bounds, is_single_image_media, fit_transition_keyframes,
+)
+from classes.query import Clip, Transition, Effect, File
 from classes.logger import log
 from classes.app import get_app
 import openshot
@@ -64,67 +70,522 @@ class ClipStandardItemModel(QStandardItemModel):
         return data
 
 
+def N_(message):
+    """Mark property names for extraction; translate when displaying them."""
+    return message
+
+
 class PropertiesModel(updates.UpdateInterface):
+    def _direct_text_properties(self, clip_data):
+        """Expose semantic typography alongside the native clip properties."""
+        style = clip_data.get("direct_text")
+        if not isinstance(style, dict):
+            return {}
+        app = get_app()
+        # While typing, show the uncommitted draft rather than the saved style.
+        controller = getattr(getattr(app, "window", None), "direct_text", None)
+        draft = None
+        if controller is not None and controller.draft is not None and controller.clip_id == clip_data.get("id"):
+            draft = dict(controller.draft, text=controller.editor.toPlainText())
+            style = draft
+        locked = any(layer.get("number") == clip_data.get("layer") and layer.get("lock", False)
+                     for layer in app.project.get("layers"))
+        properties = {}
+        definitions = (
+            ("text", N_("Text"), "string", 0, 0),
+            ("font_family", N_("Font"), "font", 0, 0),
+            ("font_bold", N_("Font Bold"), "bool", 0, 1),
+            ("font_italic", N_("Font Italic"), "bool", 0, 1),
+            ("font_size", N_("Font Size"), "int", 8, 1000),
+            ("letter_spacing", N_("Letter Spacing"), "int", -50, 200),
+            ("line_spacing", N_("Line Spacing"), "float", 0.5, 5.0),
+            ("alignment", N_("Text Alignment"), "string", 0, 0),
+            ("width", N_("Text Box Width"), "int", 64, 8192),
+            ("background_padding", N_("Text Background Padding"), "int", 0, 200),
+        )
+        for key, name, kind, minimum, maximum in definitions:
+            value = style.get(key, False if kind == "bool" else None)
+            prop = dict(name=name, type=kind, value=value, memo=str(value or ""),
+                        min=minimum, max=maximum, readonly=locked, keyframe=False,
+                        points=0, interpolation=openshot.CONSTANT, closest_point_x=1,
+                        previous_point_x=1, choices=[])
+            if key == "font_size":
+                # Dragging steps one pixel at a time instead of jumping across 8-1000.
+                prop["step_drag"] = True
+            if kind == "bool":
+                prop["choices"] = [dict(name=label, value=choice, selected=value == choice)
+                                   for choice, label in ((False, "False"), (True, "True"))]
+            if key == "alignment":
+                prop["choices"] = [dict(name=label, value=align, selected=value == align)
+                                   for align, label in (("left", "Left"), ("center", "Center"), ("right", "Right"))]
+            if kind == "color":
+                color = QColor(value)
+                for channel in ("red", "green", "blue", "alpha"):
+                    prop[channel] = {"value": getattr(color, channel)()}
+            properties["direct_text." + key] = prop
+        from classes.direct_text import text_animation_properties
+        animated = text_animation_properties(clip_data, self.frame_number)
+        for prop in animated.values():
+            prop["readonly"] = locked
+        if draft is not None:
+            from classes.direct_text import TEXT_ANIMATED
+            for key, (_, kind, _, _) in TEXT_ANIMATED.items():
+                prop = animated["text_" + key]
+                if kind == "color":
+                    color = QColor(draft[key])
+                    for channel in ("red", "green", "blue", "alpha"):
+                        prop[channel]["value"] = getattr(color, channel)()
+                else:
+                    prop["value"] = draft[key]
+        properties.update(animated)
+        return properties
+
+    def _update_direct_text_property(self, item, value, key=None):
+        """Route text edits through the shared asset transaction."""
+        property_key, metadata = self.model.item(item.row(), 0).data()
+        if metadata.get("readonly"):
+            return
+        controller = getattr(get_app().window, "direct_text", None)
+        if controller is None:
+            return
+        # Snapshot IDs before an update can refresh or rebuild the model.
+        selected = list(item.data() or [])
+        for item_id, item_type in selected:
+            if item_type == "clip":
+                controller.apply_property(item_id, key or property_key, value)
+
+    def _insert_colorgrade_keyframe(self, data, property_type, frame_number):
+        from windows.color_grade_editor import (
+            _set_color_value,
+            _set_keyframe_value,
+            curve_enabled_at_frame,
+            curve_nodes_at_frame,
+            normalize_curve_data,
+            normalize_wheels_data,
+            wheels_enabled_at_frame,
+            wheels_snapshot,
+        )
+
+        frame_number = int(round(frame_number))
+        if property_type == "colorgrade_curve":
+            updated = normalize_curve_data(data)
+            enabled = 1.0 if curve_enabled_at_frame(updated, frame_number) else 0.0
+            updated["enabled"] = _set_keyframe_value(
+                updated.get("enabled"), frame_number, enabled, openshot.LINEAR)
+            nodes_at_frame = {
+                node["id"]: node
+                for node in curve_nodes_at_frame(updated, frame_number)
+            }
+            for node in updated.get("nodes", []):
+                snapshot = nodes_at_frame.get(node.get("id"))
+                if not snapshot:
+                    continue
+                for key in ("x", "y", "left_handle_x", "left_handle_y", "right_handle_x", "right_handle_y"):
+                    node[key] = _set_keyframe_value(
+                        node.get(key), frame_number, snapshot.get(key, 0.0), openshot.LINEAR)
+            return normalize_curve_data(updated)
+
+        updated = normalize_wheels_data(data)
+        snapshot = wheels_snapshot(updated, frame_number)
+        enabled = 1.0 if wheels_enabled_at_frame(updated, frame_number) else 0.0
+        updated["enabled_keyframes"] = _set_keyframe_value(
+            updated.get("enabled_keyframes"), frame_number, enabled, openshot.LINEAR)
+        for name in ("global", "shadows", "midtones", "highlights"):
+            wheel = updated.get(name, {})
+            wheel_snapshot = snapshot.get(name, {})
+            wheel["color_keyframes"] = _set_color_value(
+                wheel.get("color_keyframes"), frame_number, QColor(wheel_snapshot.get("color", "#ffffff")),
+                openshot.LINEAR)
+            wheel["amount_keyframes"] = _set_keyframe_value(
+                wheel.get("amount_keyframes"), frame_number, wheel_snapshot.get("amount", 0.0), openshot.LINEAR)
+            wheel["luma_keyframes"] = _set_keyframe_value(
+                wheel.get("luma_keyframes"), frame_number, wheel_snapshot.get("luma", 0.0), openshot.LINEAR)
+        return normalize_wheels_data(updated)
+
+    def _remove_colorgrade_keyframe(self, data, property_type, frame_number):
+        from windows.color_grade_editor import normalize_curve_data, normalize_wheels_data
+
+        frame_number = int(round(frame_number))
+        if property_type == "colorgrade_curve":
+            updated = normalize_curve_data(data)
+        else:
+            updated = normalize_wheels_data(data)
+
+        changed = False
+
+        def _remove_from_keyframe(kf_data):
+            nonlocal changed
+            points = kf_data.get("Points") if isinstance(kf_data, dict) else None
+            if not isinstance(points, list) or len(points) <= 1:
+                return
+            filtered = []
+            for point in points:
+                try:
+                    keep = int(round(float(point.get("co", {}).get("X")))) != frame_number
+                except (TypeError, ValueError):
+                    keep = True
+                if keep:
+                    filtered.append(point)
+            if len(filtered) != len(points):
+                kf_data["Points"] = filtered
+                changed = True
+
+        def _walk(value):
+            if isinstance(value, dict):
+                if isinstance(value.get("Points"), list):
+                    _remove_from_keyframe(value)
+                    return
+                for child in value.values():
+                    _walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    _walk(child)
+
+        _walk(updated)
+        if property_type == "colorgrade_curve":
+            return normalize_curve_data(updated), changed
+        return normalize_wheels_data(updated), changed
+
+    def _save_colorgrade_keyframe_update(self, item, operation):
+        property = self.model.item(item.row(), 0).data()
+        property_type = property[1]["type"]
+        property_key = property[0]
+        object_id = property[1]["object_id"]
+        item_data = item.data()
+        any_updated = False
+
+        for item_id, item_type in item_data:
+            clip_updated = False
+            c = None
+            if item_type == "clip":
+                c = Clip.get(id=item_id)
+            elif item_type == "transition":
+                c = Transition.get(id=item_id)
+            elif item_type == "effect":
+                c = Effect.get(id=item_id)
+            if not c or not c.data:
+                continue
+
+            clip_data = c.data
+            objects = {}
+            if object_id:
+                objects = c.data.get('objects', {})
+                clip_data = objects.get(object_id, {})
+                if not clip_data:
+                    log.debug("No clip data found for this object id")
+                    continue
+            if property_key not in clip_data:
+                continue
+
+            if operation == "insert":
+                clip_data[property_key] = self._insert_colorgrade_keyframe(
+                    clip_data[property_key], property_type, self.frame_number)
+                clip_updated = True
+            else:
+                clip_data[property_key], clip_updated = self._remove_colorgrade_keyframe(
+                    clip_data[property_key], property_type, self.frame_number)
+
+            if not clip_updated:
+                continue
+            if not object_id:
+                clip_data = {property_key: clip_data.get(property_key)}
+            else:
+                clip_data = self._tracked_object_update_payload(c.data, object_id, clip_data, property_key)
+            c.data = clip_data
+            c.save()
+            any_updated = True
+
+        if any_updated:
+            if not self._trim_preview_mode:
+                get_app().window.refreshFrameSignal.emit()
+
+        current_row = self.parent.currentIndex().row()
+        self.parent.clearSelection()
+        if current_row >= 0:
+            self.parent.setCurrentIndex(self.model.index(current_row, 0))
+
+    def insert_keyframe(self, item):
+        property = self.model.item(item.row(), 0).data()
+        property_type = property[1]["type"]
+        if property_type in ("colorgrade_curve", "colorgrade_wheels"):
+            self._save_colorgrade_keyframe_update(item, "insert")
+            return
+        if property_type == "color":
+            property_data = property[1]
+            current_color = QColor(
+                int(property_data["red"]["value"]),
+                int(property_data["green"]["value"]),
+                int(property_data["blue"]["value"]),
+                int(property_data.get("alpha", {}).get("value", property_data.get("max", 255.0))),
+            )
+            self.color_update(item, current_color, force_insert=True)
+            return
+
+        # Explicit insertion captures the evaluated value at the playhead,
+        # even when the dock is editing a preceding keyframe.
+        value = property[1]["value"]
+        self.value_updated(item, value=value, force_insert=True)
+
+    def _resolve_reader_source_path(self, value):
+        """Resolve a reader property value to a filesystem path when possible."""
+        if value in (None, ""):
+            return ""
+
+        if isinstance(value, dict):
+            value = value.get("path", "")
+
+        source_value = str(value).strip()
+        if not source_value:
+            return ""
+
+        if os.path.exists(source_value):
+            return source_value
+
+        file_obj = File.get(path=source_value)
+        if file_obj:
+            return file_obj.absolute_path()
+
+        return source_value
+
+    def _reader_display_name(self, selected_item, reader_memo):
+        """Resolve a human-friendly reader display name from File.name when available."""
+        reader_json = json.loads(reader_memo or "{}")
+        reader_path = reader_json.get("path", "")
+        file_id = reader_json.get("id")
+
+        if getattr(selected_item, "data", None):
+            file_id = selected_item.data.get("file_id") or file_id
+
+        if file_id:
+            file_obj = File.get(id=file_id)
+            if file_obj:
+                file_name = str(file_obj.data.get("name", "")).strip()
+                if file_name:
+                    return file_name
+
+        return os.path.basename(reader_path)
+
+    def _mask_reader_data(self, data):
+        reader = {}
+        if isinstance(data, dict):
+            for key in ("mask_reader", "reader"):
+                candidate = data.get(key)
+                if isinstance(candidate, dict):
+                    reader = candidate
+                    break
+        return reader
+
+    def _transition_uses_static_mask(self, transition_data):
+        reader = self._mask_reader_data(transition_data)
+        if not reader:
+            return True
+        if not reader.get("path") and not reader.get("id") and not reader.get("has_single_image"):
+            return True
+        if isinstance(reader, dict) and "has_single_image" in reader:
+            return bool(reader.get("has_single_image"))
+        return bool(is_single_image_media(reader))
+
+    def _mask_source_is_animated(self, data):
+        reader = self._mask_reader_data(data)
+        return bool(isinstance(reader, dict) and reader.get("has_single_image") is False)
+
+    def _transition_default_keyframes(self, duration, start_value, end_value, contrast_value):
+        fps = get_app().project.get("fps")
+        fps_float = float(fps["num"]) / float(fps["den"])
+        duration = max(0.0, float(duration or 0.0))
+
+        brightness = openshot.Keyframe()
+        brightness.AddPoint(1, float(start_value), openshot.BEZIER)
+        if float(start_value) != float(end_value):
+            brightness.AddPoint(round(duration * fps_float) + 1, float(end_value), openshot.BEZIER)
+        contrast = openshot.Keyframe(float(contrast_value))
+        return json.loads(brightness.Json()), json.loads(contrast.Json())
+
+    def _effect_filter_base_properties(self, effect_data):
+        """Return effect base properties that should remain hidden."""
+        hidden = ["position", "layer", "start", "end", "duration"]
+        if not isinstance(effect_data, dict):
+            return hidden
+
+        is_mask = (
+            effect_data.get("type") == "Mask"
+            or effect_data.get("class_name") == "Mask"
+            or "mask_reader" in effect_data
+        )
+        if is_mask and self._mask_source_is_animated(effect_data):
+            return ["position", "layer", "duration"]
+        return hidden
+
+    def _refresh_selected_effect_filters(self):
+        if not self.selected:
+            return
+        item, item_type = self.selected[0]
+        if item_type != "effect":
+            return
+
+        effect_id = None
+        try:
+            effect_id = item.Id()
+        except Exception:
+            effect_id = None
+        effect_obj = Effect.get(id=effect_id) if effect_id else None
+        next_filter_base_properties = self._effect_filter_base_properties(
+            getattr(effect_obj, "data", None)
+        )
+        if next_filter_base_properties != self.filter_base_properties:
+            self.filter_base_properties = next_filter_base_properties
+            self.new_item = True
+        else:
+            self.filter_base_properties = next_filter_base_properties
+
+    def _resolve_tracked_object_id(self, raw_properties, tracked_objects_raw_properties):
+        """Resolve selected tracked object ID from properties payload."""
+        if not tracked_objects_raw_properties:
+            return None
+
+        selected_idx = raw_properties.get("selected_object_index", {}).get("value")
+        if selected_idx not in (None, "", "None"):
+            selected_idx = str(selected_idx)
+            try:
+                selected_idx_number = int(float(selected_idx))
+            except (TypeError, ValueError):
+                selected_idx_number = None
+            if selected_idx_number == -1 and "all" in tracked_objects_raw_properties:
+                return "all"
+            if selected_idx in tracked_objects_raw_properties:
+                return selected_idx
+
+            # Newer tracked-object IDs are "<effect-uuid>-<index>".
+            suffix = f"-{selected_idx}"
+            for object_id in tracked_objects_raw_properties.keys():
+                if object_id.endswith(suffix):
+                    return object_id
+
+        # Fallback to first tracked object
+        return next(iter(tracked_objects_raw_properties.keys()))
+
+    def _tracked_object_is_all(self, object_id):
+        return str(object_id).strip().lower() in {"all", "*", "-1"}
+
+    def _tracked_object_clip_data(self, effect_data, object_id):
+        """Return editable tracked object data, using a real object as template for 'all'."""
+        objects = effect_data.get('objects', {})
+        if not object_id:
+            return effect_data, False
+        if self._tracked_object_is_all(object_id):
+            template = objects.get("all")
+            if not isinstance(template, dict):
+                template = next((value for key, value in objects.items()
+                                 if not self._tracked_object_is_all(key) and isinstance(value, dict)), {})
+            return json.loads(json.dumps(template or {})), True
+        return objects.get(object_id, {}), False
+
+    def _tracked_object_update_payload(self, effect_data, object_id, clip_data, property_key):
+        """Build an effect update payload for one tracked object property edit."""
+        property_payload = json.loads(json.dumps(clip_data.get(property_key)))
+        if self._tracked_object_is_all(object_id):
+            objects_payload = {object_id: {property_key: property_payload}}
+            for existing_id, existing_data in effect_data.get('objects', {}).items():
+                if self._tracked_object_is_all(existing_id) or not isinstance(existing_data, dict):
+                    continue
+                objects_payload[existing_id] = {property_key: property_payload}
+            return {'objects': objects_payload}
+        return {'objects': {object_id: {property_key: property_payload}}}
+
     # This method is invoked by the UpdateManager each time a change happens (i.e UpdateInterface)
     def changed(self, action):
+        if action and action.type == "update" and is_keyframe_patch(action.values):
+            PropertiesModel.queue_live_transform_refresh(self)
+            return
+        # A rich editor already owns this value and updates its row preview.
+        # Skip only its synchronous save notification, not other edits or undo.
+        preview_values = getattr(self, "_live_preview_values", None)
+        if preview_values is not None and action and action.values is preview_values:
+            return
 
         # Handle change
-        if action.key and action.key[0] in ["clips", "effects"] and action.type in ["update", "insert"]:
-            log.debug(action.values)
+        if action and len(action.key) >= 1 and action.key[0] in ["clips", "effects"] and action.type in ["update", "insert"]:
+            log.debug("Property model received %s for %s", action.type, action.key)
+            self._refresh_selected_objects()
+            self._refresh_selected_effect_filters()
             # Update the model data
             self.update_model(get_app().window.txtPropertyFilter.text())
 
     # Update the selected item (which drives what properties show up)
-    def update_item(self, item_id, item_type):
-        # Keep track of id and type
-        self.next_item_id = item_id
-        self.next_item_type = item_type
+    def update_item(self, selection):
+        """Update selected items list"""
+        self.next_selection = selection
 
-        # Update the model data
-        self.update_timer.start()
+        if not selection and self.selected:
+            self.update_item_timeout()
+        else:
+            self.update_timer.start()
 
     # Update the next item (once the timer runs out)
     def update_item_timeout(self):
         # Get the next item id, and type
-        item_id = self.next_item_id
-        item_type = self.next_item_type
+        selection = self.next_selection or []
 
         # Clear previous selection
         self.selected = []
         self.filter_base_properties = []
 
-        log.debug("Update item: %s" % item_type)
+        if selection:
+            timeline = get_app().window.timeline_sync.timeline
+            for sel in selection:
+                item_id = sel.get("id")
+                item_type = sel.get("type")
+                if item_type == "clip":
+                    c = timeline.GetClip(item_id)
+                    if c:
+                        self.selected.append((c, item_type))
+                elif item_type == "transition":
+                    t = timeline.GetEffect(item_id)
+                    if t:
+                        self.selected.append((t, item_type))
+                elif item_type == "effect":
+                    e = timeline.GetClipEffect(item_id)
+                    if e:
+                        self.selected.append((e, item_type))
+                        self.selected_parent = e.ParentClip()
+                        self._refresh_selected_effect_filters()
 
-        timeline = get_app().window.timeline_sync.timeline
-        if item_type == "clip":
-            item = timeline.GetClip(item_id)
-        elif item_type == "transition":
-            item = timeline.GetEffect(item_id)
-        elif item_type == "effect":
-            item = timeline.GetClipEffect(item_id)
-            # Filter out basic properties, since this is an effect on a clip
-            self.filter_base_properties = ["position", "layer", "start", "end", "duration"]
-            if item:
-                # We also need the parent
-                self.selected_parent = item.ParentClip()
-        else:
-            item = None
+            self.selected_ids = [(obj.Id(), kind) for obj, kind in self.selected]
 
-        if not item:
-            return
-        self.selected.append((item, item_type))
+            # Update frame # from timeline
+            self.update_frame(get_app().window.preview_thread.player.Position(), reload_model=False)
 
-        # Update frame # from timeline
-        self.update_frame(get_app().window.preview_thread.player.Position(), reload_model=False)
-
-        # Get ID of item
-        self.new_item = True
+            # Get ID of item
+            self.new_item = True
 
         # Update the model data
+        if not selection:
+            self.selected_ids = []
         self.update_model(get_app().window.txtPropertyFilter.text())
+
+    def _refresh_selected_objects(self):
+        """Resolve borrowed native objects after a clip/effect was replaced."""
+        selected_ids = getattr(self, "selected_ids", None)
+        if not selected_ids:
+            return
+        timeline = get_app().window.timeline_sync.timeline
+        getters = {"clip": timeline.GetClip, "transition": timeline.GetEffect,
+                   "effect": timeline.GetClipEffect}
+        previous_count = len(self.selected)
+        self.selected = []
+        self.selected_parent = None
+        for item_id, item_type in selected_ids:
+            obj = getters[item_type](item_id)
+            if obj:
+                self.selected.append((obj, item_type))
+                if item_type == "effect":
+                    self.selected_parent = obj.ParentClip()
+        if len(self.selected) != previous_count:
+            self.new_item = True
 
     # Update the values of the selected clip, based on the current frame
     def update_frame(self, frame_number, reload_model=True):
+        self.playhead_frame = frame_number
 
         # Check for a selected clip
         if self.selected:
@@ -147,23 +608,48 @@ class PropertiesModel(updates.UpdateInterface):
 
             # Determine the frame needed for this clip (based on the position on the timeline)
             time_diff = (requested_time - clip.Position()) + clip.Start()
-            self.frame_number = round(time_diff * fps_float) + 1
+            new_frame_number = round(time_diff * fps_float) + 1
+            if new_frame_number != self.frame_number:
+                # If frame # has changed
+                self.frame_number = new_frame_number
 
-            # Calculate biggest and smallest possible frames
-            min_frame_number = round((clip.Start() * fps_float)) + 1
-            max_frame_number = round((clip.End() * fps_float)) + 1
+                # Calculate biggest and smallest possible frames
+                min_frame_number = round((clip.Start() * fps_float)) + 1
+                max_frame_number = round((clip.End() * fps_float))
 
-            # Adjust frame number if out of range
-            if self.frame_number < min_frame_number:
-                self.frame_number = min_frame_number
-            if self.frame_number > max_frame_number:
-                self.frame_number = max_frame_number
+                # Adjust frame number if out of range
+                if self.frame_number < min_frame_number:
+                    self.frame_number = min_frame_number
+                if self.frame_number > max_frame_number:
+                    self.frame_number = max_frame_number
 
-            log.info("Update frame to %s" % self.frame_number)
+                # Update the model data
+                if reload_model:
+                    self.update_model(get_app().window.txtPropertyFilter.text())
 
-            # Update the model data
-            if reload_model:
-                self.update_model(get_app().window.txtPropertyFilter.text())
+    def _edit_frame(self, item_id, item_type, force_insert):
+        """The frame to edit on one selected item, and whether to keyframe it.
+
+        Each item uses the playhead's position within itself. When the playhead
+        is outside an item, its nearest keyframe changes instead.
+        """
+        auto_keyframes = force_insert or auto_keyframes_enabled(get_app().window)
+        if getattr(self, "playhead_frame", None) is None:
+            return self.frame_number, auto_keyframes
+        getter = {"clip": "GetClip", "transition": "GetEffect", "effect": "GetClipEffect"}.get(item_type)
+        obj = getter and getattr(get_app().window.timeline_sync.timeline, getter)(item_id)
+        if obj and item_type == "effect":
+            obj = obj.ParentClip()
+        if not obj:
+            return self.frame_number, auto_keyframes
+
+        fps = get_app().project.get("fps")
+        fps_float = float(fps["num"]) / float(fps["den"])
+        requested_time = float(self.playhead_frame - 1) / fps_float
+        frame = round((requested_time - obj.Position() + obj.Start()) * fps_float) + 1
+        first, last = round(obj.Start() * fps_float) + 1, round(obj.End() * fps_float)
+        inside = first <= frame <= last
+        return min(max(frame, first), last), auto_keyframes and (inside or force_insert)
 
     def remove_keyframe(self, item):
         """Remove an existing keyframe (if any)"""
@@ -171,183 +657,428 @@ class PropertiesModel(updates.UpdateInterface):
         # Determine what was changed
         property = self.model.item(item.row(), 0).data()
         property_type = property[1]["type"]
+        if property[0].startswith("direct_text."):
+            return
         closest_point_x = property[1]["closest_point_x"]
         property_type = property[1]["type"]
         property_key = property[0]
-        clip_id, item_type = item.data()
+        object_id = property[1]["object_id"]
+        item_data = item.data()
 
-        # Find this clip
-        c = None
-        clip_updated = False
+        if property_type in ("colorgrade_curve", "colorgrade_wheels"):
+            self._save_colorgrade_keyframe_update(item, "remove")
+            return
 
-        if item_type == "clip":
-            # Get clip object
-            c = Clip.get(id=clip_id)
-        elif item_type == "transition":
-            # Get transition object
-            c = Transition.get(id=clip_id)
-        elif item_type == "effect":
-            # Get effect object
-            c = Effect.get(id=clip_id)
-
-        if c and property_key in c.data:  # Update clip attribute
-            log.debug("remove keyframe: %s" % c.data)
-
-            # Determine type of keyframe (normal or color)
-            keyframe_list = []
-            if property_type == "color":
-                keyframe_list = [c.data[property_key]["red"], c.data[property_key]["blue"], c.data[property_key]["green"]]
-            else:
-                keyframe_list = [c.data[property_key]]
-
-            # Loop through each keyframe (red, blue, and green)
-            for keyframe in keyframe_list:
-
-                # Keyframe
-                # Loop through points, find a matching points on this frame
-                closest_point = None
-                point_to_delete = None
-                for point in keyframe["Points"]:
-                    if point["co"]["X"] == self.frame_number:
-                        # Found point, Update value
-                        clip_updated = True
-                        point_to_delete = point
-                        break
-                    if point["co"]["X"] == closest_point_x:
-                        closest_point = point
-
-                # If no point found, use closest point x
-                if not point_to_delete:
-                    point_to_delete = closest_point
-
-                # Delete point (if needed)
-                if point_to_delete:
-                    clip_updated = True
-                    log.debug("Found point to delete at X=%s" % point_to_delete["co"]["X"])
-                    keyframe["Points"].remove(point_to_delete)
-
-            # Reduce # of clip properties we are saving (performance boost)
-            c.data = {property_key: c.data[property_key]}
-
-            # Save changes
-            if clip_updated:
-                # Save
-                c.save()
-
-                # Update the preview
-                get_app().window.refreshFrameSignal.emit()
-
-            # Clear selection
-            self.parent.clearSelection()
-
-    def color_update(self, item, new_color, interpolation=-1, interpolation_details=[]):
-        """Insert/Update a color keyframe for the selected row"""
-
-        # Determine what was changed
-        property = self.model.item(item.row(), 0).data()
-        property_type = property[1]["type"]
-        closest_point_x = property[1]["closest_point_x"]
-        previous_point_x = property[1]["previous_point_x"]
-        property_key = property[0]
-        clip_id, item_type = item.data()
-
-        if property_type == "color":
+        for item_id, item_type in item_data:
             # Find this clip
             c = None
             clip_updated = False
 
             if item_type == "clip":
                 # Get clip object
-                c = Clip.get(id=clip_id)
+                c = Clip.get(id=item_id)
             elif item_type == "transition":
                 # Get transition object
-                c = Transition.get(id=clip_id)
+                c = Transition.get(id=item_id)
             elif item_type == "effect":
                 # Get effect object
-                c = Effect.get(id=clip_id)
+                c = Effect.get(id=item_id)
 
-            if c:
-                # Update clip attribute
-                if property_key in c.data:
-                    log.debug("color update: %s" % c.data)
+            if not c:
+                return
 
-                    # Loop through each keyframe (red, blue, and green)
-                    for color, new_value in [
-                            ("red", new_color.red()),
-                            ("blue", new_color.blue()),
-                            ("green", new_color.green()),
-                            ]:
+            # Create reference
+            clip_data = c.data
+            if object_id:
+                clip_data, _ = self._tracked_object_clip_data(c.data, object_id)
+                if not clip_data:
+                    log.debug("No clip data found for this object id")
+                    return
 
-                        # Keyframe
-                        # Loop through points, find a matching points on this frame
-                        found_point = False
-                        for point in c.data[property_key][color]["Points"]:
-                            log.debug("looping points: co.X = %s" % point["co"]["X"])
-                            if interpolation == -1 and point["co"]["X"] == self.frame_number:
-                                # Found point, Update value
-                                found_point = True
-                                clip_updated = True
-                                # Update point
-                                point["co"]["Y"] = new_value
-                                log.debug(
-                                    "updating point: co.X = %d to value: %.3f",
-                                    point["co"]["X"], float(new_value))
-                                break
+            if property_key in clip_data:  # Update clip attribute
+                log_id = "{}/{}".format(item_id, object_id) if object_id else item_id
+                log.debug("%s: remove %s keyframe. %s", log_id, property_key, clip_data.get(property_key))
 
-                            elif interpolation > -1 and point["co"]["X"] == previous_point_x:
-                                # Only update interpolation type (and the LEFT side of the curve)
-                                found_point = True
-                                clip_updated = True
-                                point["interpolation"] = interpolation
-                                if interpolation == 0:
-                                    point["handle_right"] = point.get("handle_right") or {"Y": 0.0, "X": 0.0}
-                                    point["handle_right"]["X"] = interpolation_details[0]
-                                    point["handle_right"]["Y"] = interpolation_details[1]
+                # Determine type of keyframe (normal or color)
+                keyframe_list = []
+                if property_type == "color":
+                    keyframe_list = [clip_data[property_key][channel] for channel in ("red", "blue", "green", "alpha")
+                                     if channel in clip_data[property_key]]
+                else:
+                    keyframe_list = [clip_data[property_key]]
 
-                                log.debug(
-                                    "updating interpolation mode point: co.X = %d to %d",
-                                    point["co"]["X"], interpolation)
-                                log.debug("use interpolation preset: %s", str(interpolation_details))
+                text_default = None
+                if property_key.startswith("text_") and clip_data.get("direct_text"):
+                    from classes.direct_text import TEXT_ANIMATED, initialize_text_curves
+                    if property_key[5:] in TEXT_ANIMATED:
+                        defaults = copy.deepcopy(clip_data)
+                        defaults["text_style_overrides"] = []
+                        text_default = initialize_text_curves(defaults)[property_key]
 
-                            elif interpolation > -1 and point["co"]["X"] == closest_point_x:
-                                # Only update interpolation type (and the RIGHT side of the curve)
-                                found_point = True
-                                clip_updated = True
-                                point["interpolation"] = interpolation
-                                if interpolation == 0:
-                                    point["handle_left"] = point.get("handle_left") or {"Y": 0.0, "X": 0.0}
-                                    point["handle_left"]["X"] = interpolation_details[2]
-                                    point["handle_left"]["Y"] = interpolation_details[3]
-
-                                log.debug(
-                                    "updating interpolation mode point: co.X = %d to %d",
-                                    point["co"]["X"], interpolation)
-                                log.debug("use interpolation preset: %s", str(interpolation_details))
-
-                        # Create new point (if needed)
-                        if not found_point:
+                # Loop through each keyframe (red, blue, and green)
+                for keyframe_index, keyframe in enumerate(keyframe_list):
+                    # Keyframe
+                    # Loop through points, find a matching points on this frame
+                    closest_point = None
+                    point_to_delete = None
+                    for point in keyframe["Points"]:
+                        if point["co"]["X"] == self.frame_number:
+                            # Found point, Update value
                             clip_updated = True
-                            log.debug("Created new point at X=%d", self.frame_number)
-                            c.data[property_key][color]["Points"].append({
-                                'co': {'X': self.frame_number, 'Y': new_value},
-                                'interpolation': 1,
-                                })
+                            point_to_delete = point
+                            break
+                        if point["co"]["X"] == closest_point_x:
+                            closest_point = point
+
+                    # If no point found, use closest point x
+                    if not point_to_delete:
+                        point_to_delete = closest_point
+
+                    # Delete point (if needed)
+                    if point_to_delete:
+                        clip_updated = True
+                        log.debug("Found point to delete at X=%s" % point_to_delete["co"]["X"])
+                        keyframe["Points"].remove(point_to_delete)
+
+                        # Check for 0 keyframes (and use sane defaults instead of the 0.0 default value)
+                        default_value = None
+                        if not keyframe["Points"]:
+                            if text_default is not None:
+                                default_curve = text_default
+                                if property_type == "color":
+                                    default_curve = text_default[("red", "blue", "green", "alpha")[keyframe_index]]
+                                default_value = default_curve["Points"][0]["co"]["Y"]
+                            elif property_key in ["alpha", "scale_x", "scale_y", "time", "volume"]:
+                                default_value = 1.0
+                            elif property_key in ["origin_x", "origin_y"]:
+                                default_value = 0.5
+                            elif property_key in ["location_x", "location_y", "rotation", "shear_x", "shear_y"]:
+                                default_value = 0.0
+                            elif property_key in ["has_audio", "has_video", "channel_filter", "channel_mapping"]:
+                                default_value = -1.0
+                            elif property_key in ["wave_color"]:
+                                if keyframe_index == 0:
+                                    # Red
+                                    default_value = 0.0
+                                elif keyframe_index == 1:
+                                    # Blue
+                                    default_value = 255.0
+                                elif keyframe_index == 2:
+                                    # Green
+                                    default_value = 123.0
+                            if default_value is not None:
+                                keyframe["Points"].append({
+                                    'co': {'X': self.frame_number, 'Y': default_value},
+                                    'interpolation': 1})
+
+                # Enforce clip timing constraints and fit simple transition fades.
+                transition_props = []
+                if property_key in ("time", "start", "end", "duration"):
+                    clamp_timing_to_media(clip_data, c)
+                    if item_type == "transition" and not object_id and property_key != "time":
+                        fps = get_app().project.get("fps")
+                        transition_props = fit_transition_keyframes(clip_data, fps["num"] / fps["den"])
+
+                # Determine if waveforms are impacted by this change
+                has_waveform = False
+                waveform_file_id = None
+                if property_key == "volume":
+                    if clip_data.get("ui", {}).get("audio_data", []):
+                        waveform_file_id = c.data.get("file_id")
+                        has_waveform = True
+
+                use_transition_update = item_type == "transition" and not object_id and property_key == "mask_reader"
+                full_transition_data = clip_data if use_transition_update else None
 
                 # Reduce # of clip properties we are saving (performance boost)
-                c.data = {property_key: c.data[property_key]}
+                if use_transition_update:
+                    pass
+                elif not object_id:
+                    if property_key == "time":
+                        clip_data = {k: clip_data.get(k) for k in ("time", "end", "duration", "start")}
+                    elif property_key in ("start", "end", "duration"):
+                        clip_data = {k: clip_data.get(k) for k in ["start", "end", "duration"] + transition_props}
+                    else:
+                        clip_data = {property_key: clip_data.get(property_key)}
+                else:
+                    clip_data = self._tracked_object_update_payload(c.data, object_id, clip_data, property_key)
 
                 # Save changes
                 if clip_updated:
-                    # Save
-                    c.save()
+                    if use_transition_update:
+                        timeline = getattr(get_app().window, "timeline", None)
+                        if timeline:
+                            timeline.update_transition_data(full_transition_data, only_basic_props=False)
+                            c = Transition.get(id=item_id) or c
+                        else:
+                            log.warning(
+                                "Timeline unavailable for transition mask_reader update; saving transition %s directly",
+                                item_id,
+                            )
+                            c.data = full_transition_data
+                            c.save()
+                    else:
+                        # Save
+                        c.data = clip_data
+                        c.save()
+
+                    # Update waveforms (if needed)
+                    if has_waveform:
+                        get_audio_data({waveform_file_id: [c.id]})
 
                     # Update the preview
-                    get_app().window.refreshFrameSignal.emit()
+                    if not self._trim_preview_mode:
+                        get_app().window.refreshFrameSignal.emit()
 
-                # Clear selection
+                # Clear selection and restore focus to label column
+                current_row = self.parent.currentIndex().row()
                 self.parent.clearSelection()
+                if current_row >= 0:
+                    self.parent.setCurrentIndex(self.model.index(current_row, 0))
 
-    def value_updated(self, item, interpolation=-1, value=None, interpolation_details=[]):
+    def color_update(self, item, new_color, interpolation=-1, interpolation_details=[], force_insert=False):
+        """Insert/Update a color keyframe for the selected row"""
+
+        # Determine what was changed
+        property = self.model.item(item.row(), 0).data()
+        property_type = property[1]["type"]
+        if property[0].startswith("direct_text."):
+            self._update_direct_text_property(item, new_color.name(QColor.HexArgb))
+            return
+        closest_point_x = property[1]["closest_point_x"]
+        previous_point_x = property[1]["previous_point_x"]
+        property_key = property[0]
+        object_id = property[1]["object_id"]
+        item_data = item.data()
+
+        for item_id, item_type in item_data:
+            if property_type == "color":
+                # Find this clip
+                c = None
+                clip_updated = False
+
+                if item_type == "clip":
+                    # Get clip object
+                    c = Clip.get(id=item_id)
+                elif item_type == "transition":
+                    # Get transition object
+                    c = Transition.get(id=item_id)
+                elif item_type == "effect":
+                    # Get effect object
+                    c = Effect.get(id=item_id)
+
+                if c:
+                    frame_number, auto_keyframes = self._edit_frame(item_id, item_type, force_insert)
+
+                    # Create reference
+                    clip_data = c.data
+                    if object_id:
+                        clip_data, _ = self._tracked_object_clip_data(c.data, object_id)
+                        if not isinstance(clip_data, dict):
+                            clip_data = {}
+
+                    # Update clip attribute
+                    if property_key not in clip_data and object_id:
+                        clip_data[property_key] = {
+                            channel: json.loads(json.dumps(property[1].get(channel, {"Points": []})))
+                            for channel in ("red", "blue", "green", "alpha")
+                            if channel in property[1]
+                        }
+                        for channel in ("red", "blue", "green"):
+                            clip_data[property_key].setdefault(channel, {"Points": []})
+
+                    if property_key in clip_data:
+                        log_id = "{}/{}".format(item_id, object_id) if object_id else item_id
+                        log.debug("%s: update color property %s. %s", log_id, property_key, clip_data.get(property_key))
+
+                        # Loop through each keyframe (red, blue, green, and alpha)
+                        for color, new_value in [
+                                ("red", new_color.red()),
+                                ("blue", new_color.blue()),
+                                ("green", new_color.green()),
+                                ("alpha", new_color.alpha()),
+                                ]:
+
+                            # Keyframe
+                            # Make sure this color property exists in the clip data
+                            if color not in clip_data[property_key]:
+                                log.debug(f"Creating new color component: {color}")
+                                clip_data[property_key][color] = {"Points": []}
+
+                            target_frame = edit_frame(
+                                clip_data[property_key][color].get("Points", []), frame_number, auto_keyframes)
+
+                            # Loop through points, find a matching points on this frame
+                            found_point = False
+                            for point in clip_data[property_key][color].get("Points", []):
+                                log.debug("looping points: co.X = %s" % point["co"]["X"])
+                                if interpolation == -1 and point["co"]["X"] == target_frame:
+                                    # Found point, Update value
+                                    found_point = True
+                                    clip_updated = True
+                                    # Update point
+                                    point["co"]["Y"] = new_value
+                                    log.debug(
+                                        "updating point: co.X = %d to value: %.3f",
+                                        point["co"]["X"], float(new_value))
+                                    break
+
+                                elif interpolation > -1 and point["co"]["X"] == previous_point_x:
+                                    # Only update the LEFT side of the curve (i.e. the previous point's right handle)
+                                    found_point = True
+                                    clip_updated = True
+                                    if point.get("interpolation", 2) == 0 and interpolation_details:
+                                        point["handle_right"] = point.get("handle_right") or {"Y": 0.0, "X": 0.0}
+                                        point["handle_right"]["X"] = interpolation_details[0]
+                                        point["handle_right"]["Y"] = interpolation_details[1]
+
+                                        log.debug("updating previous point (right handle): co.X = %d", point["co"]["X"])
+                                        log.debug("use interpolation preset: %s", str(interpolation_details))
+                                    else:
+                                        # Remove unused bezier property
+                                        point.pop("handle_right", None)
+
+                                elif interpolation > -1 and point["co"]["X"] == closest_point_x:
+                                    # Only update interpolation type (and the RIGHT side of the curve)
+                                    found_point = True
+                                    clip_updated = True
+                                    point["interpolation"] = interpolation
+                                    if interpolation == 0 and interpolation_details:
+                                        point["handle_left"] = point.get("handle_left") or {"Y": 0.0, "X": 0.0}
+                                        point["handle_left"]["X"] = interpolation_details[2]
+                                        point["handle_left"]["Y"] = interpolation_details[3]
+                                    else:
+                                        # Remove unused bezier property
+                                        point.pop("handle_left", None)
+
+                                    log.debug("updating interpolation mode point: co.X = %d to %d",
+                                              point["co"]["X"], interpolation)
+                                    log.debug("use interpolation preset: %s", str(interpolation_details))
+
+                            # Create new point (if needed)
+                            if not found_point:
+                                clip_updated = True
+                                log.debug("Created new point at X=%d", target_frame)
+                                clip_data[property_key][color].setdefault("Points", []).append({
+                                    'co': {'X': target_frame, 'Y': new_value},
+                                    'interpolation': 1,
+                                    })
+
+                    # Reduce # of clip properties we are saving (performance boost)
+                    if not object_id:
+                        clip_data = {property_key: clip_data.get(property_key)}
+                    else:
+                        clip_data = self._tracked_object_update_payload(c.data, object_id, clip_data, property_key)
+
+                    # Save changes
+                    if clip_updated:
+                        # Save
+                        c.data = clip_data
+                        c.save()
+
+                        # Update the preview
+                        if not self._trim_preview_mode:
+                            get_app().window.refreshFrameSignal.emit()
+
+                    # Clear selection and restore focus to label column
+                    current_row = self.parent.currentIndex().row()
+                    self.parent.clearSelection()
+                    if current_row >= 0:
+                        self.parent.setCurrentIndex(self.model.index(current_row, 0))
+
+    def _colorgrade_interpolation_at_frame(self, data, property_type, frame_number):
+        def _find_in_keyframe(kf_data):
+            points = kf_data.get("Points") if isinstance(kf_data, dict) else None
+            if not isinstance(points, list):
+                return None
+            for point in points:
+                try:
+                    if int(round(float(point["co"]["X"]))) == int(round(frame_number)):
+                        return int(point.get("interpolation", openshot.LINEAR))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            return None
+
+        def _walk(value):
+            found = _find_in_keyframe(value)
+            if found is not None:
+                return found
+            if isinstance(value, dict):
+                for child in value.values():
+                    found = _walk(child)
+                    if found is not None:
+                        return found
+            elif isinstance(value, list):
+                for child in value:
+                    found = _walk(child)
+                    if found is not None:
+                        return found
+            return None
+
+        found = _walk(data)
+        return openshot.LINEAR if found is None else found
+
+    def _apply_colorgrade_interpolation(self, data, property_type, previous_point_x,
+                                        closest_point_x, interpolation, interpolation_details):
+        if interpolation < 0:
+            return data, False
+
+        from windows.color_grade_editor import normalize_curve_data, normalize_wheels_data
+
+        if property_type == "colorgrade_curve":
+            updated = normalize_curve_data(data)
+        else:
+            updated = normalize_wheels_data(data)
+
+        changed = False
+        previous_frame = int(round(previous_point_x))
+        closest_frame = int(round(closest_point_x))
+
+        def _frame_matches(point, frame):
+            try:
+                return int(round(float(point.get("co", {}).get("X")))) == frame
+            except (TypeError, ValueError):
+                return False
+
+        def _update_keyframe(kf_data):
+            nonlocal changed
+            points = kf_data.get("Points") if isinstance(kf_data, dict) else None
+            if not isinstance(points, list):
+                return
+            for point in points:
+                if _frame_matches(point, previous_frame):
+                    changed = True
+                    if int(point.get("interpolation", openshot.LINEAR)) == openshot.BEZIER and interpolation_details:
+                        point["handle_right"] = point.get("handle_right") or {"Y": 0.0, "X": 0.0}
+                        point["handle_right"]["X"] = interpolation_details[0]
+                        point["handle_right"]["Y"] = interpolation_details[1]
+                    else:
+                        point.pop("handle_right", None)
+                if _frame_matches(point, closest_frame):
+                    changed = True
+                    point["interpolation"] = interpolation
+                    if interpolation == openshot.BEZIER and interpolation_details:
+                        point["handle_left"] = point.get("handle_left") or {"Y": 0.0, "X": 0.0}
+                        point["handle_left"]["X"] = interpolation_details[2]
+                        point["handle_left"]["Y"] = interpolation_details[3]
+                    else:
+                        point.pop("handle_left", None)
+
+        def _walk(value):
+            if isinstance(value, dict):
+                if isinstance(value.get("Points"), list):
+                    _update_keyframe(value)
+                    return
+                for child in value.values():
+                    _walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    _walk(child)
+
+        _walk(updated)
+        return updated, changed
+
+    def value_updated(self, item, interpolation=-1, value=None, interpolation_details=None, refresh_model=True, force_insert=False):
         """ Table cell change event - also handles context menu to update interpolation value """
 
         if self.ignore_update_signal:
@@ -358,16 +1089,36 @@ class PropertiesModel(updates.UpdateInterface):
 
         # Determine what was changed
         property = self.model.item(item.row(), 0).data()
+        if property[0].startswith("direct_text."):
+            if value is None:
+                if property[1]["type"] == "int":
+                    value, valid = QLocale().system().toInt(item.text())
+                    if not valid:
+                        return
+                elif property[1]["type"] == "float":
+                    value, valid = QLocale().system().toDouble(item.text())
+                    if not valid:
+                        return
+                else:
+                    value = item.text()
+            self._update_direct_text_property(item, value)
+            return
         closest_point_x = property[1]["closest_point_x"]
         previous_point_x = property[1]["previous_point_x"]
         property_type = property[1]["type"]
         property_key = property[0]
-        clip_id, item_type = item.data()
+        object_id = property[1]["object_id"]
+        property_choices = property[1].get("choices") or []
+        choice_keyframes_use_constant = bool(property_choices) and interpolation == -1
+        objects = {}
+        item_data = item.data()
 
         # Get value (if any)
-        if item.text():
+        if item.text() or value:
             # Set and format value based on property type
-            if value is not None:
+            if value == "None":
+                new_value = ""
+            elif value is not None:
                 # Override value
                 new_value = value
             elif property_type == "string":
@@ -388,446 +1139,842 @@ class PropertiesModel(updates.UpdateInterface):
         else:
             new_value = None
 
-        log.info(
-            "%s for %s changed to %s at frame %s with interpolation: %s at closest x: %s"
-            % (property_key, clip_id, new_value, self.frame_number, interpolation, closest_point_x))
+        for item_id, item_type in item_data:
+            # Start each iteration with the original value
+            value = new_value
 
-        # Find this clip
-        c = None
-        clip_updated = False
+            # Find this clip
+            c = None
+            clip_updated = False
 
-        if item_type == "clip":
-            # Get clip object
-            c = Clip.get(id=clip_id)
-        elif item_type == "transition":
-            # Get transition object
-            c = Transition.get(id=clip_id)
-        elif item_type == "effect":
-            # Get effect object
-            c = Effect.get(id=clip_id)
+            if item_type == "clip":
+                # Get clip object
+                c = Clip.get(id=item_id)
+            elif item_type == "transition":
+                # Get transition object
+                c = Transition.get(id=item_id)
+            elif item_type == "effect":
+                # Get effect object
+                c = Effect.get(id=item_id)
 
-        if c:
-            # Update clip attribute
-            if property_key in c.data:
-                log.debug("value updated: %s" % c.data)
+            if c and c.data:
+                is_mask_reader_update = (
+                    not object_id
+                    and property_key == "mask_reader"
+                )
 
-                # Check the type of property (some are keyframe, and some are not)
-                if property_type != "reader" and type(c.data[property_key]) == dict:
-                    # Keyframe
-                    # Loop through points, find a matching points on this frame
-                    found_point = False
-                    point_to_delete = None
-                    for point in c.data[property_key]["Points"]:
-                        log.debug("looping points: co.X = %s" % point["co"]["X"])
-                        if interpolation == -1 and point["co"]["X"] == self.frame_number:
-                            # Found point, Update value
-                            found_point = True
-                            clip_updated = True
-                            # Update or delete point
-                            if new_value is not None:
-                                point["co"]["Y"] = float(new_value)
-                                log.debug(
-                                    "updating point: co.X = %d to value: %.3f",
-                                    point["co"]["X"], float(new_value))
+                # Create reference
+                clip_data = c.data
+                if object_id:
+                    clip_data, _ = self._tracked_object_clip_data(c.data, object_id)
+                    if not clip_data:
+                        log.debug("No clip data found for this object id")
+                        return
+
+                if (
+                    property_key not in clip_data
+                    and item_type == "effect"
+                    and property_key in {"left", "top", "right", "bottom"}
+                    and property_type == "float"
+                ):
+                    clip_data[property_key] = {"Points": []}
+                elif (
+                    property_key not in clip_data
+                    and object_id
+                    and property_type in {"bool", "float", "int"}
+                ):
+                    clip_data[property_key] = {
+                        "Points": json.loads(json.dumps(property[1].get("Points", [])))
+                    }
+
+                # Update clip attribute
+                if property_key in clip_data:
+                    log_id = "{}/{}".format(item_id, object_id) if object_id else item_id
+                    log.debug("%s: update property %s. %s", log_id, property_key, clip_data.get(property_key))
+
+                    # Check the type of property (some are keyframe, and some are not)
+                    if property_type in ["colorgrade_curve", "colorgrade_wheels"] and interpolation > -1:
+                        updated_value, clip_updated = self._apply_colorgrade_interpolation(
+                            clip_data[property_key],
+                            property_type,
+                            previous_point_x,
+                            closest_point_x,
+                            interpolation,
+                            interpolation_details,
+                        )
+                        if clip_updated:
+                            clip_data[property_key] = updated_value
+
+                    elif property_type not in ["reader", "colorgrade_curve", "colorgrade_wheels"] and isinstance(clip_data[property_key], dict):
+                        # Keyframe
+
+                        # Protection from HUGE scale values
+                        if property_key in ['scale_x', 'scale_y', 'shear_x', 'shear_y'] and value:
+                            width = get_app().project.get("width")
+                            height = get_app().project.get("height")
+                            is_svg = clip_data.get("reader", {}).get("path", "").lower().endswith("svg")
+                            if is_svg:
+                                max_multiple = 15
                             else:
-                                point_to_delete = point
-                            break
+                                max_multiple = 50
+                            if width > 0 and height > 0:
+                                # Clamp the max scale based on project size
+                                max_multiple = round((2000 * max_multiple) / max(width, height))
 
-                        elif interpolation > -1 and point["co"]["X"] == previous_point_x:
-                            # Only update interpolation type (and the LEFT side of the curve)
-                            found_point = True
+                            # Apply the calculated max_multiple to value
+                            value = max(min(value, max_multiple), -max_multiple)
+
+                        frame_number, auto_keyframes = self._edit_frame(item_id, item_type, force_insert)
+                        target_frame = edit_frame(
+                            clip_data[property_key].get("Points", []), frame_number, auto_keyframes)
+
+                        # Loop through points, find a matching points on this frame
+                        found_point = False
+                        point_to_delete = None
+                        for point in clip_data[property_key].get('Points', []):
+                            log.debug("looping points: co.X = %s" % point["co"]["X"])
+                            if interpolation == -1 and point["co"]["X"] == target_frame:
+                                # Found point, Update value
+                                found_point = True
+                                clip_updated = True
+                                # Update or delete point
+                                if value is not None:
+                                    point["co"]["Y"] = int(value) if property_key == "time" else float(value)
+                                    if choice_keyframes_use_constant:
+                                        point["interpolation"] = openshot.CONSTANT
+                                    log.debug("updating point: co.X = %d to value: %s",
+                                              point["co"]["X"], value)
+                                else:
+                                    point_to_delete = point
+                                break
+
+                            if interpolation > -1 and point["co"]["X"] == previous_point_x:
+                                # Only update the LEFT side of the curve (i.e. the previous point's right handle)
+                                found_point = True
+                                clip_updated = True
+                                if point.get("interpolation", 2) == 0 and interpolation_details:
+                                    point["handle_right"] = point.get("handle_right") or {"Y": 0.0, "X": 0.0}
+                                    point["handle_right"]["X"] = interpolation_details[0]
+                                    point["handle_right"]["Y"] = interpolation_details[1]
+
+                                    log.debug("updating previous point (right handle): co.X = %d", point["co"]["X"])
+                                    log.debug("use interpolation preset: %s", str(interpolation_details))
+                                else:
+                                    # Remove unused bezier property
+                                    point.pop("handle_right", None)
+
+                            if interpolation > -1 and point["co"]["X"] == closest_point_x:
+                                # Only update the RIGHT side of the curve (i.e. the closest point's left handle
+                                # and interpolation mode (only the RIGHT SIDE POINT controls the interpolation mode)
+                                found_point = True
+                                clip_updated = True
+                                point["interpolation"] = interpolation
+                                if interpolation == 0 and interpolation_details:
+                                    point["handle_left"] = point.get("handle_left") or {"Y": 0.0, "X": 0.0}
+                                    point["handle_left"]["X"] = interpolation_details[2]
+                                    point["handle_left"]["Y"] = interpolation_details[3]
+                                else:
+                                    # Remove unused bezier property
+                                    point.pop("handle_left", None)
+
+                                log.debug("updating interpolation mode point: co.X = %d to %d",
+                                          point["co"]["X"], interpolation)
+                                log.debug("use interpolation preset: %s", str(interpolation_details))
+
+                        # Delete point (if needed)
+                        if point_to_delete:
                             clip_updated = True
-                            point["interpolation"] = interpolation
-                            if interpolation == 0:
-                                point["handle_right"] = point.get("handle_right") or {"Y": 0.0, "X": 0.0}
-                                point["handle_right"]["X"] = interpolation_details[0]
-                                point["handle_right"]["Y"] = interpolation_details[1]
+                            log.debug("Found point to delete at X=%s" % point_to_delete["co"]["X"])
+                            clip_data[property_key]["Points"].remove(point_to_delete)
 
-                            log.debug(
-                                "updating interpolation mode point: co.X = %d to %d",
-                                point["co"]["X"], interpolation)
-                            log.debug("use interpolation preset: %s", str(interpolation_details))
-
-                        elif interpolation > -1 and point["co"]["X"] == closest_point_x:
-                            # Only update interpolation type (and the RIGHT side of the curve)
-                            found_point = True
+                        # Create new point (if needed)
+                        elif not found_point and value is not None:
                             clip_updated = True
-                            point["interpolation"] = interpolation
-                            if interpolation == 0:
-                                point["handle_left"] = point.get("handle_left") or {"Y": 0.0, "X": 0.0}
-                                point["handle_left"]["X"] = interpolation_details[2]
-                                point["handle_left"]["Y"] = interpolation_details[3]
+                            log.debug("Created new point at X=%d", target_frame)
+                            clip_data[property_key].setdefault('Points', []).append({
+                                'co': {'X': target_frame, 'Y': int(value) if property_key == "time" else value},
+                                'interpolation': openshot.CONSTANT if choice_keyframes_use_constant else openshot.LINEAR})
 
-                            log.debug(
-                                "updating interpolation mode point: co.X = %d to %d",
-                                point["co"]["X"], interpolation)
-                            log.debug("use interpolation preset: %s", str(interpolation_details))
-
-                    # Delete point (if needed)
-                    if point_to_delete:
+                if not clip_updated:
+                    # If no keyframe was found, set a basic property
+                    if property_type == "int":
                         clip_updated = True
-                        log.debug("Found point to delete at X=%s" % point_to_delete["co"]["X"])
-                        c.data[property_key]["Points"].remove(point_to_delete)
+                        try:
+                            clip_data[property_key] = int(value)
+                        except Exception:
+                            log.warn('Invalid Integer value passed to property', exc_info=1)
 
-                    # Create new point (if needed)
-                    elif not found_point and new_value is not None:
+                    elif property_type == "float":
                         clip_updated = True
-                        log.debug("Created new point at X=%d", self.frame_number)
-                        c.data[property_key]["Points"].append({
-                            'co': {'X': self.frame_number, 'Y': new_value},
-                            'interpolation': 1})
+                        try:
+                            clip_data[property_key] = float(value)
 
-            if not clip_updated:
-                # If no keyframe was found, set a basic property
-                if property_type == "int":
-                    clip_updated = True
+                            # Fix precision issues with time properties by snapping to FPS grid
+                            if property_key in ['position', 'start', 'end']:
+                                fps_num = get_app().project.get("fps").get("num")
+                                fps_den = get_app().project.get("fps").get("den")
+                                frame_duration = fps_den / fps_num
+
+                                # Snap the value to the nearest frame
+                                clip_data[property_key] = round(clip_data[property_key] / frame_duration) * frame_duration
+
+                        except Exception:
+                            log.warn('Invalid Float value passed to property', exc_info=1)
+
+                    elif property_type == "bool":
+                        clip_updated = True
+                        try:
+                            clip_data[property_key] = bool(value)
+                        except Exception:
+                            log.warn('Invalid Boolean value passed to property', exc_info=1)
+
+                    elif property_type == "string":
+                        clip_updated = True
+                        try:
+                            clip_data[property_key] = str(value or "")
+                        except Exception:
+                            log.warn('Invalid String value passed to property', exc_info=1)
+
+                    elif property_type in ["font", "caption"]:
+                        clip_updated = True
+                        try:
+                            clip_data[property_key] = str(value)
+                        except Exception:
+                            log.warn('Invalid Font/Caption value passed to property', exc_info=1)
+
+                    elif property_type in ["colorgrade_curve", "colorgrade_wheels"]:
+                        if not force_insert and not auto_keyframes_enabled(get_app().window):
+                            value = json.loads(value) if isinstance(value, str) else json.loads(json.dumps(value))
+                            retarget_keyframe_changes(clip_data[property_key], value, self.frame_number)
+                        clip_updated = True
+                        try:
+                            if isinstance(value, str):
+                                clip_data[property_key] = json.loads(value)
+                            elif isinstance(value, dict):
+                                clip_data[property_key] = value
+                            else:
+                                clip_data[property_key] = {}
+                        except Exception:
+                            log.warn('Invalid rich JSON value passed to property', exc_info=1)
+
+                    elif property_type == "reader":
+                        # Reader / mask source
+                        clip_updated = True
+                        try:
+                            selection_data = value if isinstance(value, dict) else {}
+                            selected_start = selection_data.get("start")
+                            selected_end = selection_data.get("end")
+                            reader_value = {"type": ""}
+                            if value:
+                                # Set a new source
+                                resolved_value = self._resolve_reader_source_path(value)
+                                clip_object = openshot.Clip(resolved_value)
+                                clip_object.Open()
+                                reader_value = json.loads(clip_object.Reader().Json())
+                                clip_object.Close()
+                                clip_object = None
+                            # Clear the source (set to a dict with a type field)
+                            clip_data[property_key] = reader_value
+                            if is_mask_reader_update:
+                                clip_data["mask_reader"] = reader_value
+                                clip_data["reader"] = reader_value
+
+                            if is_mask_reader_update:
+                                start_source = selected_start if selected_start is not None else clip_data.get("start", 0.0)
+                                end_source = selected_end if selected_end is not None else clip_data.get("end", start_source)
+                                start = float(start_source or 0.0)
+                                end = float(end_source or start)
+                                if end < start:
+                                    end = start
+                                duration = max(0.0, end - start)
+
+                                if self._transition_uses_static_mask(clip_data):
+                                    clip_data["start"] = 0.0
+                                    clip_data["end"] = duration
+                                    brightness, contrast = self._transition_default_keyframes(
+                                        duration, 1.0, -1.0, 3.0
+                                    )
+                                else:
+                                    clip_data["start"] = start
+                                    clip_data["end"] = end
+                                    brightness, contrast = self._transition_default_keyframes(
+                                        duration, 0.0, 0.0, 0.0
+                                    )
+
+                                clip_data["duration"] = max(
+                                    0.0,
+                                    float(clip_data.get("end", 0.0) or 0.0) - float(clip_data.get("start", 0.0) or 0.0),
+                                )
+                                clip_data["brightness"] = brightness
+                                clip_data["contrast"] = contrast
+                        except Exception:
+                            log.warn('Invalid Reader value passed to property: %s', value, exc_info=1)
+
+                # Enforce clip timing constraints and fit simple transition fades.
+                transition_props = []
+                if property_key in ("time", "start", "end", "duration"):
+                    clamp_timing_to_media(clip_data, c)
+                    if item_type == "transition" and not object_id and property_key != "time":
+                        fps = get_app().project.get("fps")
+                        transition_props = fit_transition_keyframes(clip_data, fps["num"] / fps["den"])
+
+                # Determine if waveforms are impacted by this change
+                has_waveform = False
+                waveform_file_id = None
+                if property_key == "volume":
+                    if clip_data.get("ui", {}).get("audio_data", []):
+                        waveform_file_id = c.data.get("file_id")
+                        has_waveform = True
+
+                # Reduce # of clip properties we are saving (performance boost)
+                if is_mask_reader_update:
+                    pass
+                elif not object_id:
+                    if property_key == "time":
+                        clip_data = {k: clip_data.get(k) for k in ("time", "end", "duration", "start")}
+                    elif property_key in ("start", "end", "duration"):
+                        # Clamping a trim can change all three timing fields.
+                        # Keep the saved duration consistent with the new bounds.
+                        clip_data = {k: clip_data.get(k) for k in ["start", "end", "duration"] + transition_props}
+                    else:
+                        clip_data = {property_key: clip_data.get(property_key)}
+                else:
+                    clip_data = self._tracked_object_update_payload(c.data, object_id, clip_data, property_key)
+
+                # Save changes
+                if clip_updated:
+                    # Save
+                    c.data = clip_data
+                    previous_preview = getattr(self, "_live_preview_values", None)
+                    if not refresh_model:
+                        self._live_preview_values = clip_data
                     try:
-                        c.data[property_key] = int(new_value)
-                    except Exception as ex:
-                        log.warn('Invalid Integer value passed to property: %s' % ex)
+                        c.save()
+                    finally:
+                        self._live_preview_values = previous_preview
 
-                elif property_type == "float":
-                    clip_updated = True
-                    try:
-                        c.data[property_key] = float(new_value)
-                    except Exception as ex:
-                        log.warn('Invalid Float value passed to property: %s' % ex)
+                    # Update waveforms (if needed)
+                    if has_waveform:
+                        get_audio_data({waveform_file_id: [c.id]})
 
-                elif property_type == "bool":
-                    clip_updated = True
-                    try:
-                        c.data[property_key] = bool(new_value)
-                    except Exception as ex:
-                        log.warn('Invalid Boolean value passed to property: %s' % ex)
+                    # Update the preview
+                    get_app().window.refreshFrameSignal.emit()
 
-                elif property_type == "string":
-                    clip_updated = True
-                    try:
-                        c.data[property_key] = str(new_value)
-                    except Exception as ex:
-                        log.warn('Invalid String value passed to property: %s' % ex)
+                    log.debug("Item %s: changed %s at frame %s (x: %s)",
+                              item_id, property_key, self.frame_number, closest_point_x)
 
-                elif property_type in ["font", "caption"]:
-                    clip_updated = True
-                    try:
-                        c.data[property_key] = str(new_value)
-                    except Exception as ex:
-                        log.warn('Invalid Font/Caption value passed to property: %s' % ex)
+                # Clear selection and restore focus to label column
+                current_row = self.parent.currentIndex().row()
+                self.parent.clearSelection()
+                if current_row >= 0:
+                    self.parent.setCurrentIndex(self.model.index(current_row, 0))
 
-                elif property_type == "reader":
-                    # Transition
-                    clip_updated = True
-                    try:
-                        clip_object = openshot.Clip(value)
-                        clip_object.Open()
-                        c.data[property_key] = json.loads(clip_object.Reader().Json())
-                        clip_object.Close()
-                        clip_object = None
-                    except Exception as ex:
-                        log.warn('Invalid Reader value passed to property: %s (%s)' % (value, ex))
+    def _property_edit_point(self, name, points, metadata):
+        """Use native frame hints without repeatedly traversing entire curves."""
+        if getattr(self, "_reading_native_properties", False):
+            indexes = getattr(self, "_edit_point_indexes", {})
+            cached = indexes.get(name)
+            if cached is None or cached[0] is not points or cached[1] != len(points):
+                by_frame = {}
+                for point in points:
+                    by_frame.setdefault(point["co"]["X"], point)
+                cached = indexes[name] = (points, len(points), by_frame)
+                self._edit_point_indexes = indexes
+            # Native metadata uses sorted curves, including boundary clamping.
+            closest = metadata.get("closest_point_x", -1)
+            target = None
+            if isinstance(closest, (int, float)):
+                target = closest if closest <= self.frame_number else metadata.get("previous_point_x", -1)
+            point = cached[2].get(target)
+            if point is not None:
+                return target, point
+        target = edit_frame(points, self.frame_number, False)
+        return target, next(p for p in points if p["co"]["X"] == target)
 
-            # Reduce # of clip properties we are saving (performance boost)
-            c.data = {property_key: c.data.get(property_key)}
-
-            # Save changes
-            if clip_updated:
-                # Save
-                c.save()
-
-                # Update the preview
-                get_app().window.refreshFrameSignal.emit()
-
-                log.info("Item %s: changed %s to %s at frame %s (x: %s)" % (clip_id, property_key, new_value, self.frame_number, closest_point_x))
-
-            # Clear selection
-            self.parent.clearSelection()
-
-    def update_model(self, filter=""):
-        log.debug("updating clip properties model.")
+    def set_property(self, property, filter, c, item_type, object_id=None):
         app = get_app()
         _ = app._tr
+        label = property[1]["name"]
+        name = property[0]
 
-        # Check for a selected clip
-        if self.selected and self.selected[0]:
-            c, item_type = self.selected[0]
+        # Constrain time keyframes to the reader's frame range
+        if name == "time" and getattr(c, "data", None):
+            _, max_frames = clip_time_bounds(c.data, c)
+            if max_frames:
+                property[1]["min"] = 1
+                property[1]["max"] = float(max_frames)
 
-            # Skip blank clips
-            # TODO: Determine why c is occasional = None
-            if not c:
-                return
+        value = property[1]["value"]
+        type = property[1]["type"]
+        memo = property[1]["memo"]
+        readonly = property[1]["readonly"]
+        keyframe = property[1]["keyframe"]
+        points = property[1]["points"]
+        interpolation = property[1]["interpolation"]
+        edit_tooltip = ""
+        if not readonly and not auto_keyframes_enabled(app.window):
+            data = getattr(self, "_edit_source_data", {}) or {}
+            if object_id:
+                data, _parent = self._tracked_object_clip_data(data, object_id)
+            curve = data.get(name, {}) if isinstance(data, dict) else {}
+            if isinstance(curve, dict) and curve.get("Points"):
+                target, point = self._property_edit_point(name, curve["Points"], property[1])
+                edit_tooltip = _("Editing keyframe at frame %s") % int(target)
+                if type in ("float", "int") and not property[1]["choices"]:
+                    value = point["co"]["Y"]
 
-            # Get raw unordered JSON properties
-            raw_properties = json.loads(c.PropertiesJSON(self.frame_number))
-            all_properties = OrderedDict(sorted(raw_properties.items(), key=lambda x: x[1]['name']))
+        # Colorgrade types store nested keyframe structures libopenshot doesn't parse,
+        # so compute keyframe/points from the actual nested data.
+        if type in ["colorgrade_curve", "colorgrade_wheels"]:
+            from windows.color_grade_editor import colorgrade_keyframe_frames
+            data_key = "curve" if type == "colorgrade_curve" else "wheels"
+            colorgrade_data = property[1].get(data_key)
+            frame_set = colorgrade_keyframe_frames(colorgrade_data, type)
+            points = max(1, len(frame_set))
+            keyframe = int(round(self.frame_number)) in frame_set
+            if frame_set:
+                sorted_frames = sorted(frame_set)
+                current_frame = int(round(self.frame_number))
+                closest_frame = next((frame for frame in sorted_frames if frame >= current_frame), sorted_frames[-1])
+                closest_index = sorted_frames.index(closest_frame)
+                previous_frame = sorted_frames[max(0, closest_index - 1)]
+                property[1]["closest_point_x"] = closest_frame
+                property[1]["previous_point_x"] = previous_frame
+                interpolation = self._colorgrade_interpolation_at_frame(colorgrade_data, type, closest_frame)
+                property[1]["interpolation"] = interpolation
+            property[1]["points"] = points
+            property[1]["keyframe"] = keyframe
+        choices = property[1]["choices"]
+        # Add object id reference to QStandardItem
+        property[1]["object_id"] = object_id
 
-            # Check if filter was changed (if so, wipe previous model data)
-            if self.previous_filter != filter:
-                self.previous_filter = filter
-                self.new_item = True  # filter changed, so we need to regenerate the entire model
+        # Adding Transparency to translation file
+        transparency_label = _("Transparency")  # noqa
 
-            # Ignore any events from this method
-            self.ignore_update_signal = True
+        selected_choice = None
+        if choices:
+            selected_choices = [c for c in choices if c.get("selected") is True]
+            if selected_choices:
+                selected_choice = selected_choices[0]["name"]
 
-            # Clear previous model data (if item is different)
-            if self.new_item:
-                # Prepare for new properties
-                self.items = {}
+        # Hide filtered out properties
+        if filter and filter.lower() not in _(label).lower():
+            return
+
+        # Hide unused base properties (if any)
+        if name in self.filter_base_properties:
+            return
+
+        # Insert new data into model, or update existing values
+        row = []
+        if self.new_item:
+
+            # Append Property Name
+            col = QStandardItem("Property")
+            col.setText(_(label))
+            col.setData(property)
+            if keyframe and points > 1:
+                col.setBackground(QColor("green"))  # Highlight keyframe background
+            elif points > 1:
+                col.setBackground(QColor(42, 130, 218))  # Highlight interpolated value background
+            if readonly or type in ["color", "font", "caption"] or choices or label == "Track":
+                col.setFlags(Qt.ItemIsEnabled)
+            else:
+                col.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            row.append(col)
+
+            # Append Value
+            col = QStandardItem("Value")
+            if selected_choice:
+                col.setText(_(selected_choice))
+            elif type == "string":
+                # Use string value
+                col.setText(memo)
+            elif type == "font":
+                # Use font value
+                col.setText(memo)
+            elif type == "caption":
+                # Use caption value
+                col.setText(memo)
+            elif type == "bool":
+                # Use boolean value
+                if value:
+                    col.setText(_("True"))
+                else:
+                    col.setText(_("False"))
+            elif type == "color":
+                # Don't output a value for colors
+                col.setText("")
+            elif type == "reader":
+                col.setText(self._reader_display_name(c, memo))
+            elif type in ["colorgrade_curve", "colorgrade_wheels"]:
+                col.setText(property[1].get("summary", memo))
+            elif type == "int" and label == "Track":
+                # Find track display name
+                all_tracks = get_app().project.get("layers")
+                display_count = len(all_tracks)
+                display_label = None
+                try:
+                    value_int = int(float(value))
+                except (TypeError, ValueError):
+                    value_int = value
+                for track in reversed(sorted(all_tracks, key=itemgetter('number'))):
+                    if track.get("number") == value_int:
+                        display_label = track.get("label")
+                        break
+                    display_count -= 1
+                track_name = display_label or _("Track %s") % QLocale().toString(display_count)
+                col.setText(track_name)
+
+            elif type == "int":
+                try:
+                    int_value = int(float(value))
+                    col.setText("%d" % int_value)
+                except (TypeError, ValueError):
+                    col.setText("" if value is None else str(value))
+            else:
+                # Use numeric value
+                if value == "" or value is None:
+                    col.setText("")
+                else:
+                    col.setText(QLocale().system().toString(float(value), "f", precision=3))
+            col.setData([(obj.Id(), t) for obj, t in self.selected])
+            if points > 1:
+                # Apply icon to cell
+                my_icon = QPixmap(":/curves/keyframe-%s.png" % interpolation)
+                col.setData(my_icon, Qt.DecorationRole)
+
+                # Set the background color of the cell
+                if keyframe:
+                    col.setBackground(QColor("green"))  # Highlight keyframe background
+                else:
+                    col.setBackground(QColor(42, 130, 218))  # Highlight interpolated value background
+
+            if type == "color":
+                # Color needs to be handled special
+                vals = property[1]
+                # r, g, b
+                r, g, b = (int(vals[c]["value"]) for c in ("red", "green", "blue"))
+                # alpha falls back to vals["max"] (usually 255) if missing
+                a = int(vals.get("alpha", {}).get("value", vals.get("max", 255.0)))
+                col.setBackground(QColor(r, g, b, a))
+
+            if readonly or type in ["color", "font", "caption", "colorgrade_curve", "colorgrade_wheels"] or choices or label == "Track":
+                col.setFlags(Qt.ItemIsEnabled)
+            else:
+                col.setFlags(
+                    Qt.ItemIsSelectable
+                    | Qt.ItemIsEnabled
+                    | Qt.ItemIsUserCheckable
+                    | Qt.ItemIsEditable)
+            row.append(col)
+
+            # Append ROW to MODEL (if does not already exist in model)
+            self.model.appendRow(row)
+            if type == "caption":
+                # Load caption editor after both label/value cells exist.
+                get_app().window.CaptionTextLoaded.emit(memo, row)
+
+        elif name in self.items and self.items[name]["row"]:
+            # Update the value of the existing model
+            # Get 1st Column
+            col = self.items[name]["row"][0]
+            # QVariant wraps Python tuples by identity. Replacing equal metadata
+            # otherwise emits dataChanged for every label on every refresh.
+            if col.data() != property:
+                col.setData(property)
+
+            # For non-color types, update the background color
+            if keyframe and points > 1:
+                col.setBackground(QColor("green"))  # Highlight keyframe background
+            elif points > 1:
+                col.setBackground(QColor(42, 130, 218))  # Highlight interpolated value background
+            else:
+                col.setBackground(QBrush())
+
+            # Update helper dictionary
+            row.append(col)
+
+            # Get 2nd Column
+            col = self.items[name]["row"][1]
+            if selected_choice:
+                col.setText(_(selected_choice))
+            elif type == "string":
+                # Use string value
+                col.setText(memo)
+            elif type == "font":
+                # Use font value
+                col.setText(memo)
+            elif type == "caption":
+                # Use caption value
+                col.setText(memo)
+            elif type == "bool":
+                # Use boolean value
+                if value:
+                    col.setText(_("True"))
+                else:
+                    col.setText(_("False"))
+            elif type == "color":
+                # Don't output a value for colors
+                col.setText("")
+            elif type in ["colorgrade_curve", "colorgrade_wheels"]:
+                col.setText(property[1].get("summary", memo))
+            elif type == "int" and label == "Track":
+                # Find track display name
+                all_tracks = get_app().project.get("layers")
+                display_count = len(all_tracks)
+                display_label = None
+                try:
+                    value_int = int(float(value))
+                except (TypeError, ValueError):
+                    value_int = value
+                for track in reversed(sorted(all_tracks, key=itemgetter('number'))):
+                    if track.get("number") == value_int:
+                        display_label = track.get("label")
+                        break
+                    display_count -= 1
+                track_name = display_label or _("Track %s") % QLocale().toString(display_count)
+                col.setText(track_name)
+            elif type == "int":
+                try:
+                    int_value = int(float(value))
+                    col.setText("%d" % int_value)
+                except (TypeError, ValueError):
+                    col.setText("" if value is None else str(value))
+            elif type == "reader":
+                col.setText(self._reader_display_name(c, property[1].get("memo")))
+            else:
+                # Use numeric value
+                if value == "" or value is None:
+                    col.setText("")
+                else:
+                    col.setText(QLocale().system().toString(float(value), "f", precision=3))
+
+            if points > 1:
+                # Apply icon to cell
+                my_icon = QPixmap(":/curves/keyframe-%s.png" % interpolation)
+                col.setData(my_icon, Qt.DecorationRole)
+
+                # Set the background color of the cell
+                if keyframe:
+                    col.setBackground(QColor("green"))  # Highlight keyframe background
+                else:
+                    col.setBackground(QColor(42, 130, 218))  # Highlight interpolated value background
+
+            else:
+                # clear background color
+                col.setBackground(QBrush())
+
+                # clear icon
+                my_icon = QPixmap()
+                col.setData(my_icon, Qt.DecorationRole)
+
+            if type == "color":
+                # Update the color based on the color curves
+                vals = property[1]
+                # r, g, b
+                r, g, b = (int(vals[c]["value"]) for c in ("red", "green", "blue"))
+                # alpha falls back to vals["max"] (usually 255) if missing
+                a = int(vals.get("alpha", {}).get("value", vals.get("max", 255.0)))
+                col.setBackground(QColor(r, g, b, a))
+
+            # Update helper dictionary
+            row.append(col)
+            if type == "caption":
+                # Keep the editor enabled and synchronized on property refreshes.
+                get_app().window.CaptionTextLoaded.emit(memo, row)
+
+        for cell in row:
+            cell.setToolTip(edit_tooltip)
+
+        # Keep track of items in a dictionary (for quick look up)
+        self.items[name] = {"row": row, "property": property}
+
+    def queue_live_transform_refresh(self):
+        """Coalesce mouse samples and playback notifications into one UI refresh."""
+        parent = getattr(self, "parent", None)
+        if parent is not None and not parent.isVisible():
+            return
+        timer = getattr(self, "_live_transform_timer", None)
+        if timer is None:
+            timer = self._live_transform_timer = QTimer(self.parent)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda: PropertiesModel.refresh_live_transform(self))
+        if not timer.isActive():
+            timer.start(0)
+
+    def refresh_live_transform(self):
+        app = get_app()
+        preview = getattr(app.window, "videoPreview", None)
+        action = getattr(app.updates, "last_action", None)
+        if (getattr(preview, "mouse_pressed", False)
+                and is_keyframe_patch(getattr(action, "values", None))):
+            self.update_model(app.window.txtPropertyFilter.text(), live_transform=True)
+
+    def update_model(self, filter_text="", *, live_transform=False):
+        app = get_app()
+        preview = getattr(app.window, "videoPreview", None)
+        action = getattr(getattr(app, "updates", None), "last_action", None)
+        if (not live_transform and getattr(preview, "mouse_pressed", False)
+                and is_keyframe_patch(getattr(action, "values", None))):
+            PropertiesModel.queue_live_transform_refresh(self)
+            return
+        if not live_transform:
+            timer = getattr(self, "_live_transform_timer", None)
+            if timer is not None:
+                timer.stop()
+        live_clips = getattr(preview, "_live_transform_clips", {}) if live_transform else {}
+        _ = app._tr
+        refreshed = False
+
+        if self.ignore_update_signal:
+            log.debug("ignoring update signal, because we are already in an update...")
+            return
+
+        self._refresh_selected_objects()
+
+        # Ignore any events from this method
+        self.ignore_update_signal = True
+        self._reading_native_properties = True
+
+        try:
+            # Check for a selected clip
+            if self.selected and self.selected[0]:
+                c, item_type = self.selected[0]
+
+                # Skip blank clips
+                # TODO: Determine why c is occasional = None
+                if not c:
+                    return
+
+                self._edit_source_data = None
+                if len(self.selected) == 1 and not auto_keyframes_enabled(app.window):
+                    getter = {"clip": Clip.get, "transition": Transition.get, "effect": Effect.get}.get(item_type)
+                    source = live_clips.get(c.Id()) or (getter(id=c.Id()) if getter else None)
+                    # Project curves are authoritative for edits. Serializing the
+                    # whole native object here makes refresh cost grow with every keyframe.
+                    data = getattr(source, "data", None)
+                    self._edit_source_data = dict(data) if isinstance(data, dict) else json.loads(c.Json())
+
+                # Build list of raw properties for all selected items
+                all_raw_properties = []
+                for obj, _item_type in self.selected:
+                    props = json.loads(obj.PropertiesJSON(self.frame_number))
+                    if _item_type == "clip":
+                        clip = live_clips.get(obj.Id()) or Clip.get(id=obj.Id())
+                        if clip:
+                            props.update(self._direct_text_properties(clip.data))
+                    all_raw_properties.append(props)
+
+                # Use first item's properties as baseline
+                raw_properties = all_raw_properties[0]
+                tracked_object_id = None
+                tracked_object_properties = {}
+
+                if len(all_raw_properties) == 1:
+                    tracked_objects_raw_properties = raw_properties.pop('objects', None)
+                    if tracked_objects_raw_properties:
+                        tracked_object_id = self._resolve_tracked_object_id(
+                            raw_properties, tracked_objects_raw_properties)
+                        tracked_object_properties = tracked_objects_raw_properties[tracked_object_id]
+                        raw_properties.update(tracked_object_properties)
+                else:
+                    # Remove tracked object lists before comparing
+                    if 'objects' in raw_properties:
+                        raw_properties.pop('objects')
+                    for props in all_raw_properties[1:]:
+                        props.pop('objects', None)
+
+                    # Determine shared properties across all selected items
+                    shared = {}
+                    for key, prop in raw_properties.items():
+                        matches = True
+                        for other in all_raw_properties[1:]:
+                            if key not in other or other[key].get('type') != prop.get('type') or other[key].get('name') != prop.get('name'):
+                                matches = False
+                                break
+                        if matches:
+                            values = [other[key]['value'] for other in all_raw_properties]
+                            memos = [other[key]['memo'] for other in all_raw_properties]
+                            new_prop = prop.copy()
+                            if all(v == values[0] for v in values):
+                                new_prop['value'] = values[0]
+                            else:
+                                new_prop['value'] = ''
+                            if all(m == memos[0] for m in memos):
+                                new_prop['memo'] = memos[0]
+                            else:
+                                new_prop['memo'] = ''
+                            shared[key] = new_prop
+
+                    raw_properties = shared
+
+                # Sort all properties (by 'name')
+                all_properties = OrderedDict(sorted(raw_properties.items(), key=lambda x: x[1]['name']))
+
+                # Check if filter was changed (if so, wipe previous model data)
+                if self.previous_filter != filter_text:
+                    self.previous_filter = filter_text
+                    self.new_item = True  # filter changed, so we need to regenerate the entire model
+
+                # Build or update the model
+                if self.new_item:
+                    self._edit_point_indexes = {}
+                    # Prepare for new properties
+                    self.items = {}
+                    self.model.clear()
+
+                    # Add Headers
+                    self.model.setHorizontalHeaderLabels([_("Property"), _("Value")])
+
+                    # Clear caption editor
+                    get_app().window.CaptionTextLoaded.emit("", None)
+
+                # Loop through properties, and build/update the model
+                for property in all_properties.items():
+                    if property[0] in tracked_object_properties:
+                        # Add/update tracked object property
+                        self.set_property(property, filter_text, c, item_type, object_id=tracked_object_id)
+                    else:
+                        # Add/update base property
+                        self.set_property(property, filter_text, c, item_type)
+
+                # After first render, future calls will update in place
+                self.new_item = False
+                refreshed = True
+
+            else:
+                # Clear previous model data (if any)
                 self.model.clear()
 
                 # Add Headers
                 self.model.setHorizontalHeaderLabels([_("Property"), _("Value")])
+                refreshed = True
+        finally:
+            # Done updating model (even if we returned early)
+            self.ignore_update_signal = False
+            self._reading_native_properties = False
 
-                # Clear caption editor
-                get_app().window.CaptionTextLoaded.emit("", None)
-
-            # Loop through properties, and build a model
-            for property in all_properties.items():
-                label = property[1]["name"]
-                name = property[0]
-                value = property[1]["value"]
-                type = property[1]["type"]
-                memo = property[1]["memo"]
-                readonly = property[1]["readonly"]
-                keyframe = property[1]["keyframe"]
-                points = property[1]["points"]
-                interpolation = property[1]["interpolation"]
-                choices = property[1]["choices"]
-
-                # Adding Transparency to translation file
-                transparency_label = _("Transparency")  # noqa
-
-                selected_choice = None
-                if choices:
-                    selected_choice = [c for c in choices if c["selected"] is True][0]["name"]
-
-                # Hide filtered out properties
-                if filter and filter.lower() not in _(label).lower():
-                    continue
-
-                # Hide unused base properties (if any)
-                if name in self.filter_base_properties:
-                    continue
-
-                # Insert new data into model, or update existing values
-                row = []
-                if self.new_item:
-
-                    # Append Property Name
-                    col = QStandardItem("Property")
-                    col.setText(_(label))
-                    col.setData(property)
-                    if keyframe and points > 1:
-                        col.setBackground(QColor("green"))  # Highlight keyframe background
-                    elif points > 1:
-                        col.setBackground(QColor(42, 130, 218))  # Highlight interpolated value background
-                    if readonly or type in ["color", "font", "caption"] or choices or label == "Track":
-                        col.setFlags(Qt.ItemIsEnabled)
-                    else:
-                        col.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
-                    row.append(col)
-
-                    # Append Value
-                    col = QStandardItem("Value")
-                    if selected_choice:
-                        col.setText(_(selected_choice))
-                    elif type == "string":
-                        # Use string value
-                        col.setText(memo)
-                    elif type == "font":
-                        # Use font value
-                        col.setText(memo)
-                    elif type == "caption":
-                        # Use caption value
-                        col.setText(memo)
-                        # Load caption editor also
-                        get_app().window.CaptionTextLoaded.emit(memo, row)
-                    elif type == "bool":
-                        # Use boolean value
-                        if value:
-                            col.setText(_("True"))
-                        else:
-                            col.setText(_("False"))
-                    elif type == "color":
-                        # Don't output a value for colors
-                        col.setText("")
-                    elif type == "reader":
-                        reader_json = json.loads(memo or "{}")
-                        reader_path = reader_json.get("path", "/")
-                        fileName = os.path.basename(reader_path)
-                        col.setText(fileName)
-                    elif type == "int" and label == "Track":
-                        # Find track display name
-                        all_tracks = get_app().project.get("layers")
-                        display_count = len(all_tracks)
-                        display_label = None
-                        for track in reversed(sorted(all_tracks, key=itemgetter('number'))):
-                            if track.get("number") == value:
-                                display_label = track.get("label")
-                                break
-                            display_count -= 1
-                        track_name = display_label or _("Track %s") % display_count
-                        col.setText(track_name)
-
-                    elif type == "int":
-                        col.setText("%d" % value)
-                    else:
-                        # Use numeric value
-                        col.setText(QLocale().system().toString(float(value), "f", precision=2))
-                    col.setData((c.Id(), item_type))
-                    if points > 1:
-                        # Apply icon to cell
-                        my_icon = QPixmap(":/curves/keyframe-%s.png" % interpolation)
-                        col.setData(my_icon, Qt.DecorationRole)
-
-                        # Set the background color of the cell
-                        if keyframe:
-                            col.setBackground(QColor("green"))  # Highlight keyframe background
-                        else:
-                            col.setBackground(QColor(42, 130, 218))  # Highlight interpolated value background
-
-                    if type == "color":
-                        # Color needs to be handled special
-                        red = property[1]["red"]["value"]
-                        green = property[1]["green"]["value"]
-                        blue = property[1]["blue"]["value"]
-                        col.setBackground(QColor(red, green, blue))
-
-                    if readonly or type in ["color", "font", "caption"] or choices or label == "Track":
-                        col.setFlags(Qt.ItemIsEnabled)
-                    else:
-                        col.setFlags(
-                            Qt.ItemIsSelectable
-                            | Qt.ItemIsEnabled
-                            | Qt.ItemIsUserCheckable
-                            | Qt.ItemIsEditable)
-                    row.append(col)
-
-                    # Append ROW to MODEL (if does not already exist in model)
-                    self.model.appendRow(row)
-
-                else:
-                    # Update the value of the existing model
-                    # Get 1st Column
-                    col = self.items[name]["row"][0]
-                    col.setData(property)
-
-                    # For non-color types, update the background color
-                    if keyframe and points > 1:
-                        col.setBackground(QColor("green"))  # Highlight keyframe background
-                    elif points > 1:
-                        col.setBackground(QColor(42, 130, 218))  # Highlight interpolated value background
-                    else:
-                        col.setBackground(QStandardItem("Empty").background())
-
-                    # Update helper dictionary
-                    row.append(col)
-
-                    # Get 2nd Column
-                    col = self.items[name]["row"][1]
-                    if selected_choice:
-                        col.setText(_(selected_choice))
-                    elif type == "string":
-                        # Use string value
-                        col.setText(memo)
-                    elif type == "font":
-                        # Use font value
-                        col.setText(memo)
-                    elif type == "caption":
-                        # Use caption value
-                        col.setText(memo)
-                    elif type == "bool":
-                        # Use boolean value
-                        if value:
-                            col.setText(_("True"))
-                        else:
-                            col.setText(_("False"))
-                    elif type == "color":
-                        # Don't output a value for colors
-                        col.setText("")
-                    elif type == "int" and label == "Track":
-                        # Find track display name
-                        all_tracks = get_app().project.get("layers")
-                        display_count = len(all_tracks)
-                        display_label = None
-                        for track in reversed(sorted(all_tracks, key=itemgetter('number'))):
-                            if track.get("number") == value:
-                                display_label = track.get("label")
-                                break
-                            display_count -= 1
-                        track_name = display_label or _("Track %s") % display_count
-                        col.setText(track_name)
-                    elif type == "int":
-                        col.setText("%d" % value)
-                    elif type == "reader":
-                        reader_json = json.loads(property[1].get("memo", "{}"))
-                        reader_path = reader_json.get("path", "/")
-                        fileName = os.path.basename(reader_path)
-                        col.setText("%s" % fileName)
-                    else:
-                        # Use numeric value
-                        col.setText(QLocale().system().toString(float(value), "f", precision=2))
-
-                    if points > 1:
-                        # Apply icon to cell
-                        my_icon = QPixmap(":/curves/keyframe-%s.png" % interpolation)
-                        col.setData(my_icon, Qt.DecorationRole)
-
-                        # Set the background color of the cell
-                        if keyframe:
-                            col.setBackground(QColor("green"))  # Highlight keyframe background
-                        else:
-                            col.setBackground(QColor(42, 130, 218))  # Highlight interpolated value background
-
-                    else:
-                        # clear background color
-                        col.setBackground(QStandardItem("Empty").background())
-
-                        # clear icon
-                        my_icon = QPixmap()
-                        col.setData(my_icon, Qt.DecorationRole)
-
-                    if type == "color":
-                        # Update the color based on the color curves
-                        red = property[1]["red"]["value"]
-                        green = property[1]["green"]["value"]
-                        blue = property[1]["blue"]["value"]
-                        col.setBackground(QColor(red, green, blue))
-
-                    # Update helper dictionary
-                    row.append(col)
-
-                # Keep track of items in a dictionary (for quick look up)
-                self.items[name] = {"row": row, "property": property}
-
-            # Update the values on the next call to this method (instead of adding rows)
-            self.new_item = False
-
-        else:
-            # Clear previous properties hash
-            self.previous_hash = ""
-
-            # Clear previous model data (if any)
-            self.model.clear()
-
-            # Add Headers
-            self.model.setHorizontalHeaderLabels([_("Property"), _("Value")])
-
-        # Done updating model
-        self.ignore_update_signal = False
+        if refreshed:
+            refresh_callback = getattr(self.parent, "property_model_refreshed", None)
+            if callable(refresh_callback):
+                refresh_callback()
 
     def __init__(self, parent, *args):
 
         # Keep track of the selected items (clips, transitions, etc...)
         self.selected = []
+        self.selected_ids = []
         self.current_item_id = None
         self.frame_number = 1
-        self.previous_hash = ""
+        self.playhead_frame = None
         self.new_item = True
         self.items = {}
         self.ignore_update_signal = False
         self.parent = parent
         self.previous_filter = None
         self.filter_base_properties = []
+        self._trim_preview_mode = False
 
         # Create standard model
         self.model = ClipStandardItemModel()
@@ -835,15 +1982,22 @@ class PropertiesModel(updates.UpdateInterface):
 
         # Timer to use a delay before showing properties (to prevent a mass selection from trying
         # to update the property model hundreds of times)
-        self.update_timer = QTimer()
+        self.update_timer = QTimer(parent)
         self.update_timer.setInterval(100)
         self.update_timer.setSingleShot(True)
         self.update_timer.timeout.connect(self.update_item_timeout)
-        self.next_item_id = None
-        self.next_item_type = None
+        self.next_selection = None
 
         # Connect data changed signal
         self.model.itemChanged.connect(self.value_updated)
 
         # Add self as listener to project data updates (used to update the timeline)
         get_app().updates.add_listener(self)
+        get_app().window.TrimPreviewMode.connect(self._enter_trim_preview)
+        get_app().window.TimelinePreviewMode.connect(self._exit_trim_preview)
+
+    def _enter_trim_preview(self):
+        self._trim_preview_mode = True
+
+    def _exit_trim_preview(self):
+        self._trim_preview_mode = False

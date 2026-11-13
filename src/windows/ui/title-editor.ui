@@ -14,23 +14,13 @@
    <string>Titles</string>
   </property>
   <property name="windowIcon">
-   <iconset resource="../../../images/openshot.qrc">
+   <iconset>
     <normaloff>:/openshot.svg</normaloff>:/openshot.svg</iconset>
   </property>
   <property name="autoFillBackground">
    <bool>false</bool>
   </property>
   <layout class="QGridLayout" name="gridLayout">
-   <item row="2" column="0">
-    <widget class="QDialogButtonBox" name="buttonBox">
-     <property name="orientation">
-      <enum>Qt::Horizontal</enum>
-     </property>
-     <property name="standardButtons">
-      <set>QDialogButtonBox::Cancel|QDialogButtonBox::Save</set>
-     </property>
-    </widget>
-   </item>
    <item row="0" column="0">
     <widget class="QSplitter" name="splitter">
      <property name="orientation">
@@ -108,8 +98,8 @@
            <rect>
             <x>0</x>
             <y>0</y>
-            <width>338</width>
-            <height>224</height>
+            <width>378</width>
+            <height>252</height>
            </rect>
           </property>
           <layout class="QFormLayout" name="formLayout">
@@ -121,15 +111,18 @@
         </widget>
        </item>
        <item row="0" column="0">
-        <widget class="QGraphicsView" name="graphicsView">
+        <widget class="QLabel" name="lblPreviewLabel">
+         <property name="minimumSize">
+          <size>
+           <width>0</width>
+           <height>214</height>
+          </size>
+         </property>
          <property name="styleSheet">
           <string notr="true">background-color: #191919;</string>
          </property>
-         <property name="verticalScrollBarPolicy">
-          <enum>Qt::ScrollBarAlwaysOff</enum>
-         </property>
-         <property name="horizontalScrollBarPolicy">
-          <enum>Qt::ScrollBarAlwaysOff</enum>
+         <property name="text">
+          <string/>
          </property>
         </widget>
        </item>
@@ -140,38 +133,5 @@
   </layout>
  </widget>
  <resources/>
- <connections>
-  <connection>
-   <sender>buttonBox</sender>
-   <signal>rejected()</signal>
-   <receiver>Dialog</receiver>
-   <slot>reject()</slot>
-   <hints>
-    <hint type="sourcelabel">
-     <x>184</x>
-     <y>234</y>
-    </hint>
-    <hint type="destinationlabel">
-     <x>286</x>
-     <y>274</y>
-    </hint>
-   </hints>
-  </connection>
-  <connection>
-   <sender>buttonBox</sender>
-   <signal>accepted()</signal>
-   <receiver>Dialog</receiver>
-   <slot>accept()</slot>
-   <hints>
-    <hint type="sourcelabel">
-     <x>184</x>
-     <y>228</y>
-    </hint>
-    <hint type="destinationlabel">
-     <x>157</x>
-     <y>274</y>
-    </hint>
-   </hints>
-  </connection>
- </connections>
+ <connections/>
 </ui>

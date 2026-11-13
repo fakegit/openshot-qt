@@ -7,43 +7,51 @@
 #ifndef ONLY_64_BIT
   #define ONLY_64_BIT "x64"
 #endif
-
+#ifndef PY_EXE_DIR
+  #define PY_EXE_DIR "exe.mingw-3.8"
+#endif
 
 #define MyAppName "OpenShot Video Editor"
-#define MyAppShortName "OpenShot"
 #define MyAppProjectFileDesc "OpenShot Project File"
 #define MyAppPublisher "OpenShot Studios, LLC"
 #define MyPublisherURL "https://www.openshot.org/"
 #define MySupportURL "https://www.reddit.com/r/OpenShot/"
 #define MyAppExeName "openshot-qt.exe"
 
+#include "isportable.iss"
+
 [Setup]
 ; NOTE: The value of AppId uniquely identifies this application.
 ; Do not use the same AppId value in installers for other applications.
 ; (To generate a new GUID, click Tools | Generate GUID inside the IDE.)
-AppId={{4BB0DCDC-BC24-49EC-8937-72956C33A470}
-AppName={#MyAppName}
+AppId={code:GetAppId|{{4BB0DCDC-BC24-49EC-8937-72956C33A470}}
+AppName=OpenShot Video Editor
 AppVersion={#VERSION}
+AppVerName={#MyAppName} {#VERSION}
 VersionInfoVersion={#VERSION}
 AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyPublisherURL}
 AppSupportURL={#MySupportURL}
-AppCopyright=Copyright (c) 2008-2019 {#MyAppPublisher}
-DefaultDirName={pf}\{#MyAppName}
+AppCopyright=(c) 2008-2022 {#MyAppPublisher}
+DefaultDirName={code:GetDefaultDirName|OpenShot Video Editor}
 DisableProgramGroupPage=yes
 LicenseFile=..\COPYING
 OutputBaseFilename=OpenShot
 ArchitecturesInstallIn64BitMode={#ONLY_64_BIT}
 ArchitecturesAllowed={#ONLY_64_BIT}
-ChangesAssociations=yes
-ChangesEnvironment=yes
+ChangesAssociations=not PortableCheck
+ChangesEnvironment=not PortableCheck
 Compression=lzma
 SolidCompression=yes
 WizardSmallImageFile=installer-logo.bmp
 SetupIconFile=..\xdg\openshot-qt.ico
+UsePreviousLanguage=no
+Uninstallable=not PortableCheck
 UninstallDisplayIcon={app}\{#MyAppExeName}
 SignedUninstaller=yes
 SignedUninstallerDir=..\build\
+PrivilegesRequiredOverridesAllowed=commandline
+AllowNoIcons=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -109,40 +117,38 @@ Name: "lithuanian"; MessagesFile: "compiler:Languages\Lithuanian.isl"
 Name: "icelandic"; MessagesFile: "compiler:Languages\Icelandic.isl"
 Name: "slovak"; MessagesFile: "compiler:Languages\Slovak.isl"
 
+[CustomMessages]
+english.FirewallException=Add an exception to the Windows Firewall for optionally sending anonymized usage and error information.
+italian.FirewallException=Aggiungi un'eccezione a Windows Firewall per l'invio facoltativo di informazioni anonime sull'uso/errori dell'applicazione.
+
 [Tasks]
-Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
-Name: "fileassoc"; Description: "{cm:AssocFileExtension,{#MyAppName},.osp}"; GroupDescription: "{cm:AdditionalIcons}";
-Name: "firewall"; Description: "Add an exception to the Windows Firewall for optionally sending anonymized usage and error information."; GroupDescription: "{cm:AdditionalIcons}";
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked; Check: not PortableCheck;
+Name: "fileassoc"; Description: "{cm:AssocFileExtension,{#MyAppName},.osp}"; GroupDescription: "{cm:AdditionalIcons}"; Check: not PortableCheck;
+Name: "firewall"; Description: "{cm:FirewallException}"; GroupDescription: "{cm:AdditionalIcons}"; Check: not PortableCheck;
 
 [InstallDelete]
 ; Remove previous installed versions of OpenShot
 Type: filesandordirs; Name: "{app}\*"
 Type: dirifempty; Name: "{app}\*"
-Type: files; Name: "{group}\OpenShot Video Editor"; BeforeInstall: DeleteInvalidFiles
+Type: files; Name: "{group}\OpenShot Video Editor"; BeforeInstall: DeleteInvalidFiles; Check: not PortableCheck;
 
 [Registry]
 ; Associate .osp files with the installed application. Uninstaller will clean them up, when run.
-
-; Filename extension .osp
 Root: HKLM; Subkey: "Software\Classes\.osp"; ValueType: string; ValueName: ""; ValueData: "OpenShotProject"; Flags: uninsdeletevalue; Tasks: fileassoc
 ; .osp file description, "OpenShot Project File" (OpenShotProject, internally)
 Root: HKLM; Subkey: "Software\Classes\OpenShotProject"; ValueType: string; ValueName: ""; ValueData: "{#MyAppProjectFileDesc}"; Flags: uninsdeletekey; Tasks: fileassoc
 ; Launcher association for data files of type OpenShotProject
 Root: HKLM; Subkey: "Software\Classes\OpenShotProject\shell\open\command"; ValueType: string;  ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" ""%1"""; Tasks: fileassoc
-;
-; NOT setting an icon for project files seems best, as we don't currently have one,
-; and if omitted Windows seems to generate a perfectly acceptable default.
-; (The OpenShot logo on a sheet of paper.) So, the line below is commented out.
-;
-; Root: HKLM; Subkey: "Software\Classes\OpenShotProject\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExeName},0"
+; Clean-up old, incorrect AppID Uninstaller (used in 2.6.1-dev builds)
+Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Uninstall\4BB0DCDC-BC24-49EC-8937-72956C33A470_is1"; ValueName: ""; Flags: deletekey;
 
 [Files]
 ; Add all frozen files from cx_Freeze build
-Source: "..\build\exe.mingw-3.7\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
+Source: "..\build\{#PY_EXE_DIR}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
 
 [Icons]
-Name: "{commonprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{commonprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Check: not WizardNoIcons;
+Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon; Check: not WizardNoIcons;
 
 [Run]
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""{#MyAppName}"" program=""{app}\{#MyAppExeName}"" dir=in action=allow enable=yes"; Flags: runhidden; Tasks: firewall;

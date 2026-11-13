@@ -1,5 +1,6 @@
 {
   "id": "T0",
+  "auto_optimize": null,
   "fps": {
     "num": 24,
     "den": 1
@@ -20,14 +21,14 @@
   "settings": {},
   "clips": [],
   "effects": [],
-  "export_path": "",
-  "import_path": "",
   "files": [],
   "duration": 300,
-  "scale": 15,
+  "scale": 15.0,
   "tick_pixels": 100,
   "playhead_position": 0,
+  "profile_settings": {},
   "profile": "HD 720p 30 fps",
+  "export_settings": null,
   "layers": [
     {
       "id": "L1",

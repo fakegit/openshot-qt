@@ -33,14 +33,25 @@ try:
 except ImportError:
     from xml.dom import minidom as xml
 
-from PyQt5.QtCore import Qt, QSize
-from PyQt5.QtGui import QIcon, QPixmap, QStandardItem, QStandardItemModel
+from qt_api import Qt, QSortFilterProxyModel, QItemSelectionModel
+from qt_api import QIcon, QStandardItem, QStandardItemModel
 
 import openshot
 
 from classes import info
 from classes.logger import log
 from classes.app import get_app
+
+
+class BlenderFilterProxyModel(QSortFilterProxyModel):
+    """Proxy class used for sorting and filtering model data"""
+
+    def lessThan(self, left, right):
+        """Sort blender model by a column at runtime"""
+        leftData = left.data(self.sortRole())
+        rightData = right.data(self.sortRole())
+
+        return leftData < rightData
 
 
 class BlenderModel():
@@ -102,13 +113,15 @@ class BlenderModel():
                         log.info('Invalid blender image file: %s', icon_path)
                         continue
 
+                # Load icon (using display DPI)
+                icon = QIcon()
+                icon.addFile(thumb_path)
+
                 row = []
                 flags = Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsUserCheckable
                 # Append thumbnail
                 col = QStandardItem(self.app._tr(title))
-                icon_pixmap = QPixmap(thumb_path).scaled(
-                    QSize(93, 62), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-                col.setIcon(QIcon(icon_pixmap))
+                col.setIcon(icon)
                 col.setToolTip(self.app._tr(title))
                 col.setFlags(flags)
                 row.append(col)
@@ -144,3 +157,15 @@ class BlenderModel():
         self.model = QStandardItemModel()
         self.model.setColumnCount(3)
         self.model_paths = {}
+
+        # Create proxy model (for sorting and filtering)
+        self.proxy_model = BlenderFilterProxyModel()
+        self.proxy_model.setDynamicSortFilter(True)
+        self.proxy_model.setFilterCaseSensitivity(Qt.CaseInsensitive)
+        self.proxy_model.setFilterKeyColumn(1)
+        self.proxy_model.setSortCaseSensitivity(Qt.CaseSensitive)
+        self.proxy_model.setSourceModel(self.model)
+        self.proxy_model.setSortLocaleAware(True)
+
+        # Create selection model to share between views
+        self.selection_model = QItemSelectionModel(self.proxy_model)

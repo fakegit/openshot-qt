@@ -27,78 +27,143 @@
  """
 
 import os, sys
+import copy
 import logging
 import logging.handlers
 
 from classes import info
 
-# Dictionary of logging handlers we create, keyed by type
-handlers = {}
-# Another dictionary of streams we've redirected (stdout, stderr)
-streams = {}
-
 
 class StreamToLogger(object):
     """Custom class to log all stdout and stderr streams (from libopenshot / and other libraries)"""
-    def __init__(self, logger, log_level=logging.INFO):
-        self.logger = logger
+    def __init__(self, parent_stream, log_level=logging.INFO):
+        self.parent = parent_stream or sys.__stderr__
+        self.logger = logging.LoggerAdapter(
+            logging.getLogger('OpenShot.stderr'), {'source': 'stream'})
         self.log_level = log_level
-        self.linebuf = ''
+        self.logbuf = ''
 
-    def write(self, buf):
-        for line in buf.rstrip().splitlines():
-            self.logger.log(self.log_level, line.rstrip())
+    def write(self, text):
+        self.logbuf += str(text) or ""
+        if self.parent is not None:
+            try:
+                self.parent.write(text)
+            except BrokenPipeError:
+                # The terminal/launcher went away. Continue collecting output
+                # for the file logger without repeatedly writing to the pipe.
+                self.parent = None
 
     def flush(self):
-        pass
+        if self.logbuf.rstrip():
+            self.logger.log(self.log_level, self.logbuf.rstrip())
+        self.logbuf = ''
 
     def errors(self):
         pass
 
 
-# Create logger instance
-log = logging.Logger('OpenShot')
+class StreamFilter(logging.Filter):
+    """Filter out lines that originated on the output"""
+    def filter(self, record):
+        source = getattr(record, "source", "")
+        return source != "stream"
+
+
+class ConsoleHandler(logging.StreamHandler):
+    """Keep a disconnected console from interfering with file logging."""
+
+    def handleError(self, record):
+        if isinstance(sys.exc_info()[1], BrokenPipeError):
+            self.setLevel(logging.CRITICAL + 1)
+            return
+        super().handleError(record)
+
+# Clamp log messages to a reasonable size to avoid giant lines
+MAX_LOG_MESSAGE_LENGTH = 2048
+
+
+class TruncatingFormatter(logging.Formatter):
+    """Formatter that trims overly long log messages."""
+    def format(self, record):
+        message = record.getMessage()
+        if len(message) > MAX_LOG_MESSAGE_LENGTH:
+            record = copy.copy(record)
+            record.msg = message[:MAX_LOG_MESSAGE_LENGTH] + "... [truncated]"
+            record.args = None
+        return super().format(record)
+
 
 # Set up log formatters
 template = '%(levelname)s %(module)s: %(message)s'
-console_formatter = logging.Formatter(template)
-file_formatter = logging.Formatter('%(asctime)s ' + template, datefmt='%H:%M:%S')
+console_formatter = TruncatingFormatter(template)
+file_formatter = TruncatingFormatter('%(asctime)s ' + template, datefmt='%H:%M:%S')
 
-# Add normal stderr stream handler
-sh = logging.StreamHandler()
-sh.setFormatter(console_formatter)
+# Configure root logger for minimal logging
+logging.basicConfig(level=logging.ERROR)
+root_log = logging.getLogger()
+
+# Set up our top-level logging context
+log = root_log.getChild('OpenShot')
+log.setLevel(logging.DEBUG)
+# Don't pass messages on to root logger
+log.propagate = False
+
+#
+# Create rotating file handler
+#
+fh = None
+if os.path.exists(info.USER_PATH):
+    log_path = os.path.join(info.USER_PATH, 'openshot-qt.log')
+    try:
+        fh = logging.handlers.RotatingFileHandler(
+            log_path, encoding="utf-8", maxBytes=25*1024*1024, backupCount=3
+        )
+    except OSError:
+        # Fall back silently if the log file cannot be created (e.g. during tests
+        # in read-only environments)
+        fh = logging.NullHandler()
+
+if fh:
+    fh.setLevel(info.LOG_LEVEL_FILE)
+    fh.setFormatter(file_formatter)
+    # Only add the handler when it's a real logger (NullHandler is harmless)
+    log.addHandler(fh)
+else:
+    fh = logging.NullHandler()
+    fh.setLevel(info.LOG_LEVEL_FILE)
+
+#
+# Create typical stream handler which logs to stderr
+#
+sh = ConsoleHandler(sys.stderr)
 sh.setLevel(info.LOG_LEVEL_CONSOLE)
-log.addHandler(sh)
-handlers['stream'] = sh
+sh.setFormatter(console_formatter)
 
-# Add rotating file handler
-fh = logging.handlers.RotatingFileHandler(
-    os.path.join(info.USER_PATH, 'openshot-qt.log'), encoding="utf-8", maxBytes=25*1024*1024, backupCount=3)
-fh.setFormatter(file_formatter)
-fh.setLevel(info.LOG_LEVEL_FILE)
-log.addHandler(fh)
-handlers['file'] = fh
+# Filter out redirected output on console, to avoid duplicates
+filt = StreamFilter()
+sh.addFilter(filt)
+
+log.addHandler(sh)
+# Let each handler filter independently, including console-only DEBUG.
+log.setLevel(min(fh.level, sh.level))
 
 
 def reroute_output():
     """Route stdout and stderr to logger (custom handler)"""
-    if not getattr(sys, 'frozen', False):
-        # Hang on to the original objects
-        streams.update({
-            'stderr': sys.stderr,
-            'stdout': sys.stdout,
-            })
-        # Re-route output streams
-        handlers['stdout'] = StreamToLogger(log, logging.INFO)
-        sys.stdout = handlers['stdout']
-        handlers['stderr'] = StreamToLogger(log, logging.ERROR)
-        sys.stderr = handlers['stderr']
+    if (getattr(sys, 'frozen', False)
+       or sys.stdout != sys.__stdout__):
+        return
+    sys.stdout = StreamToLogger(sys.stdout, logging.INFO)
+    sys.stderr = StreamToLogger(sys.stderr, logging.WARNING)
 
 
 def set_level_file(level=logging.INFO):
-    handlers['file'].setLevel(level)
+    """Adjust the minimum log level written to our logfile"""
+    fh.setLevel(level)
+    log.setLevel(min(fh.level, sh.level))
 
 
 def set_level_console(level=logging.INFO):
-    handlers['stream'].setLevel(level)
-
+    """Adjust the minimum log level for output to the terminal"""
+    sh.setLevel(level)
+    log.setLevel(min(fh.level, sh.level))

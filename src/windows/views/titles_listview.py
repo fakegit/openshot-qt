@@ -25,8 +25,9 @@
  along with OpenShot Library.  If not, see <http://www.gnu.org/licenses/>.
  """
 
-from PyQt5.QtCore import QSize, QTimer, Qt, QModelIndex
-from PyQt5.QtWidgets import QListView
+from classes import info
+from qt_api import QTimer, Qt, QModelIndex, QItemSelectionModel
+from qt_api import QListView
 
 from windows.models.titles_model import TitlesModel, TitleRoles
 
@@ -35,12 +36,16 @@ class TitlesListView(QListView):
     """ A QListView QWidget used on the title editor window """
 
     def currentChanged(self, current: QModelIndex, previous: QModelIndex):
-        # Get current model item
+        # When editing/duplicating an existing title, don't override the SVG
+        if getattr(self.win, "edit_file_path", None):
+            return
+        # Get current selection (if any)
+        current = self.selectionModel().currentIndex()
         if not current.isValid():
             return
-        item = self.model().itemFromIndex(current)
+
         # Display title in graphicsView
-        self.win.filename = item.data(TitleRoles.PathRole)
+        self.win.filename = current.sibling(current.row(), 0).data(TitleRoles.PathRole)
         self.win.create_temp_title(self.win.filename)
         self.win.load_svg_template()
         # Display temp image (slight delay to allow screen to be shown first)
@@ -49,6 +54,29 @@ class TitlesListView(QListView):
     def refresh_view(self):
         self.title_model.update_model()
 
+        # Sort by column 0
+        self.title_model.proxy_model.sort(0)
+
+        # When editing/duplicating an existing title, keep template selection inactive.
+        if getattr(self.win, "edit_file_path", None):
+            return
+
+        # Ensure a default selection (top item) to load controls.
+        if not self.selectionModel().hasSelection() and self.model().rowCount() > 0:
+            QTimer.singleShot(0, self._select_first_item)
+
+    def _select_first_item(self):
+        if self.selectionModel().hasSelection() or self.model().rowCount() == 0:
+            return
+        first = self.model().index(0, 0)
+        if not first.isValid():
+            return
+        self.selectionModel().setCurrentIndex(
+            first, QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows
+        )
+        self.selectionModel().select(first, QItemSelectionModel.Select)
+        self.scrollTo(first)
+
     def __init__(self, *args, window=None, **kwargs):
         # Invoke parent init
         super().__init__(*args, **kwargs)
@@ -56,9 +84,9 @@ class TitlesListView(QListView):
         self.win = window or self.parent()
         self.title_model = TitlesModel(self.win)
         # Setup header columns
-        self.setModel(self.title_model.model)
-        self.setIconSize(QSize(131, 108))
-        self.setGridSize(QSize(102, 92))
+        self.setModel(self.title_model.proxy_model)
+        self.setIconSize(info.LIST_ICON_SIZE)
+        self.setGridSize(info.LIST_GRID_SIZE)
         self.setViewMode(QListView.IconMode)
         self.setResizeMode(QListView.Adjust)
         self.setUniformItemSizes(True)

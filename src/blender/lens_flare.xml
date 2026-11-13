@@ -47,24 +47,30 @@
 		<default>3.21</default>
 	</param>
 
-	<param name="diffuse_color" type="color" title="Diffuse Color" description="">
-		<default>#ffffff</default>
-	</param>
-	
 	<param name="alpha" type="spinner" title="Alpha" description="">
 		<min>0.0</min>
-		<max>50.0</max>
-		<default>10.0</default>
+		<max>0.0</max>
+		<default>1.0</default>
+	</param>
+
+	<param name="diffuse_color" type="color" title="Emission Color" description="">
+		<default>#ffffff</default>
+	</param>
+
+	<param name="strength" type="spinner" title="Emission Strength" description="">
+		<min>0.0</min>
+		<max>30.0</max>
+		<default>0.75</default>
 	</param>
 
 	<param name="glare1_type" type="dropdown" title="Glare 1: Type of Glare" description="">
 		<values>
-            <value name="Ghosts" num="GHOSTS"/>
-			<value name="Streaks" num="STREAKS"/>
-			<value name="Simple Star" num="SIMPLE_STAR"/>
-			<value name="Fog Glow" num="FOG_GLOW"/>
+            <value name="Ghosts" num="Ghosts"/>
+			<value name="Streaks" num="Streaks"/>
+			<value name="Simple Star" num="Simple Star"/>
+			<value name="Fog Glow" num="Fog Glow"/>
 		</values>
-		<default>GHOSTS</default>
+		<default>Ghosts</default>
 	</param>
 	<param name="glare1_streaks" type="spinner" title="Glare 1: Number of Streaks" description="">
 		<min>2</min>
@@ -84,12 +90,12 @@
 
 	<param name="glare2_type" type="dropdown" title="Glare 2: Type of Glare" description="">
 		<values>
-            <value name="Ghosts" num="GHOSTS"/>
-			<value name="Streaks" num="STREAKS"/>
-			<value name="Simple Star" num="SIMPLE_STAR"/>
-			<value name="Fog Glow" num="FOG_GLOW"/>
+            <value name="Ghosts" num="Ghosts"/>
+			<value name="Streaks" num="Streaks"/>
+			<value name="Simple Star" num="Simple Star"/>
+			<value name="Fog Glow" num="Fog Glow"/>
 		</values>
-		<default>STREAKS</default>
+		<default>Streaks</default>
 	</param>
 	<param name="glare2_streaks" type="spinner" title="Glare 2: Number of Streaks" description="">
 		<min>2</min>

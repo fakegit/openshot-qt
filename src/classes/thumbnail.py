@@ -30,10 +30,17 @@ import re
 import openshot
 import socket
 import time
+import shutil
+from datetime import datetime
+from fractions import Fraction
+from requests import get
 from threading import Thread
 from classes import info
+from classes.auto_optimize import MEASUREMENT_VERSION, machine_id, source_fingerprint
 from classes.query import File
 from classes.logger import log
+from classes.path_utils import absolute_media_path
+from classes.app import get_app
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
@@ -44,43 +51,317 @@ from socketserver import ThreadingMixIn
 #  http://127.0.0.1:33723/thumbnails/9ATJTBQ71V/1/
 #  http://127.0.0.1:33723/thumbnails/9ATJTBQ71V/1
 REGEX_THUMBNAIL_URL = re.compile(r"/thumbnails/(?P<file_id>.+?)/(?P<file_frame>\d+)/*(?P<only_path>path)?/*(?P<no_cache>no-cache)?")
+THUMBNAIL_CACHE_VERSION = "20260327170000"
+THUMBNAIL_CACHE_VERSION_TS = datetime.strptime(
+    THUMBNAIL_CACHE_VERSION,
+    "%Y%m%d%H%M%S",
+).timestamp()
+THUMBNAIL_PREWARM_FPS = 4
+THUMBNAIL_DECODE_SCALE = 3.0
 
 
-def GenerateThumbnail(file_path, thumb_path, thumbnail_frame, width, height, mask, overlay):
-    """Create thumbnail image, and check for rotate metadata (if any)"""
-
-    # Create a clip object and get the reader
-    clip = openshot.Clip(file_path)
-    reader = clip.Reader()
-
-    # Open reader
-    reader.Open()
-
-    # Get the 'rotate' metadata (if any)
-    rotate = 0.0
+def GetThumbDeviceScale():
+    """Return the current Qt device scale used for thumbnail assets."""
     try:
-        if reader.info.metadata.count("rotate"):
-            rotate_data = reader.info.metadata.find("rotate").value()[1]
-            rotate = float(rotate_data)
-    except ValueError as ex:
-        log.warning("Could not parse rotation value {}: {}".format(rotate_data, ex))
+        app = get_app()
+        scale = 1.0
+
+        window = getattr(app, "window", None)
+        if window and hasattr(window, "devicePixelRatioF"):
+            scale = float(window.devicePixelRatioF())
+        elif app and hasattr(app, "primaryScreen"):
+            screen = app.primaryScreen()
+            if screen:
+                scale = float(screen.devicePixelRatio())
     except Exception:
-        log.warning("Error reading rotation metadata from {}".format(file_path), exc_info=1)
+        scale = 1.0
+    return max(1.0, scale)
+
+
+def ThumbnailFrameStepForFps(fps, target_fps=THUMBNAIL_PREWARM_FPS):
+    """Return the coarse thumbnail frame step for a source FPS."""
+    fps = float(fps or 0.0)
+    target_fps = max(1.0, float(target_fps or 1.0))
+    if fps <= 0.0:
+        return 1
+    return max(1, int(round(fps / target_fps)))
+
+
+def RoundFrameToThumbnailGrid(frame_number, fps, target_fps=THUMBNAIL_PREWARM_FPS):
+    """Round a requested frame to the nearest coarse thumbnail grid frame."""
+    frame_number = max(1, int(frame_number or 1))
+    step = ThumbnailFrameStepForFps(fps, target_fps=target_fps)
+    return max(1, int(round((frame_number - 1) / float(step))) * step + 1)
+
+
+def ThumbnailCacheId(file_id):
+    """Resolve a cache folder directly, without requiring its original entry."""
+    file = File.get(id=file_id)
+    return str((file.data.get("thumbnail_cache_id") if file else None) or file_id)
+
+
+def ThumbnailPathForFrame(file_id, thumbnail_frame):
+    """Return the canonical thumbnail path for a file/frame pair."""
+    return os.path.join(info.THUMBNAIL_PATH, ThumbnailCacheId(file_id), "{}.png".format(int(thumbnail_frame or 1)))
+
+
+def MigrateThumbnailLayout(thumbnail_root):
+    """Move flat thumbnail files into per-file subfolders."""
+    thumbnail_root = str(thumbnail_root or "")
+    if not thumbnail_root or not os.path.isdir(thumbnail_root):
+        return 0
+
+    migrated = 0
+    try:
+        entries = os.listdir(thumbnail_root)
+    except OSError as ex:
+        # Cached thumbnails are optional; a denied cache must not prevent the
+        # project itself from opening (e.g. macOS protected Downloads folders).
+        log.warning("Unable to read thumbnail cache %s: %s", thumbnail_root, ex)
+        return 0
+    for entry in entries:
+        source_path = os.path.join(thumbnail_root, entry)
+        if not os.path.isfile(source_path):
+            continue
+        if not entry.lower().endswith(".png"):
+            continue
+
+        stem = entry[:-4]
+        file_id = stem
+        frame = "1"
+        if "-" in stem:
+            file_id, frame = stem.split("-", 1)
+            if not frame.isdigit():
+                continue
+
+        target_dir = os.path.join(thumbnail_root, file_id)
+        target_path = os.path.join(target_dir, "{}.png".format(frame))
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+            if os.path.abspath(source_path) == os.path.abspath(target_path):
+                continue
+            if not os.path.exists(target_path):
+                shutil.move(source_path, target_path)
+            else:
+                os.remove(source_path)
+        except OSError as ex:
+            log.warning("Unable to migrate thumbnail %s: %s", source_path, ex)
+            continue
+        migrated += 1
+    return migrated
+
+
+def GenerateThumbnailFromFrame(frame, thumb_path, width, height, mask, overlay, rotate=0.0):
+    """Create thumbnail image from an existing decoded frame."""
+    try:
+        scale = GetThumbDeviceScale()
+    except Exception:
+        scale = 1.0
+
+    parent_path = os.path.dirname(thumb_path)
+    os.makedirs(parent_path, exist_ok=True)
+
+    thumb_width = round(width * scale)
+    thumb_height = round(height * scale)
+    frame.Thumbnail(
+        thumb_path,
+        thumb_width,
+        thumb_height,
+        mask,
+        overlay,
+        "#000",
+        False,
+        "png",
+        85,
+        float(rotate or 0.0),
+        openshot.SCALE_CROP,
+    )
+
+
+def GetThumbPath(file_id, thumbnail_frame, clear_cache=False, attempts=1):
+    """Get thumbnail path by invoking HTTP thumbnail request"""
+
+    # Clear thumb cache (if requested)
+    thumb_cache = ""
+    if clear_cache:
+        thumb_cache = "no-cache/"
+
+    # Connect to thumbnail server and get image
+    thumb_server_details = get_app().window.http_server_thread.server_address
+    thumb_address = "http://%s:%s/thumbnails/%s/%s/path/%s" % (
+        thumb_server_details[0],
+        thumb_server_details[1],
+        file_id,
+        thumbnail_frame,
+        thumb_cache)
+    attempts = max(1, int(attempts or 1))
+    for attempt in range(1, attempts + 1):
+        try:
+            r = get(thumb_address)
+        except Exception:
+            log.warning(
+                "Thumbnail path request failed file_id=%s frame=%s attempt=%s/%s",
+                file_id,
+                thumbnail_frame,
+                attempt,
+                attempts,
+                exc_info=1,
+            )
+            r = None
+
+        if r is not None and r.ok and r.text:
+            # Update thumbnail path to real one
+            return r.text
+
+        if r is not None:
+            log.warning(
+                "Thumbnail path request returned empty/miss file_id=%s frame=%s attempt=%s/%s status=%s",
+                file_id,
+                thumbnail_frame,
+                attempt,
+                attempts,
+                getattr(r, "status_code", "n/a"),
+            )
+
+        if attempt < attempts:
+            time.sleep(0.05)
+
+    return ''
+
+
+def ThumbnailProxySource(file_data, frame_number):
+    """Resolve an available optimized reader and map the source frame by timestamp."""
+    proxy = file_data.get("proxy_reader")
+    if not isinstance(proxy, dict) or proxy.get("missing"):
+        return None
+    path = absolute_media_path(proxy.get("path"))
+    if not path or not os.path.isfile(path):
+        return None
+
+    proxy_frame = frame_number
+    try:
+        source_fps = file_data["fps"]
+        proxy_fps = proxy["fps"]
+        source_rate = Fraction(int(source_fps["num"]), int(source_fps["den"]))
+        proxy_rate = Fraction(int(proxy_fps["num"]), int(proxy_fps["den"]))
+        if source_rate > 0 and proxy_rate > 0:
+            proxy_frame = max(1, round((frame_number - 1) * proxy_rate / source_rate) + 1)
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        pass
+    return path, proxy_frame
+
+
+def GenerateThumbnail(file_path, thumb_path, thumbnail_frame, width, height, mask, overlay,
+                      proxy_source=None):
+    """Create thumbnail image."""
+    try:
+        scale = GetThumbDeviceScale()
+    except Exception:
+        scale = 1.0
 
     # Create thumbnail folder (if needed)
     parent_path = os.path.dirname(thumb_path)
     if not os.path.exists(parent_path):
         os.mkdir(parent_path)
 
-    # Save thumbnail image and close readers
-    reader.GetFrame(thumbnail_frame).Thumbnail(thumb_path, width, height, mask, overlay, "#000", False, "png", 85, rotate)
-    reader.Close()
-    clip.Close()
+    thumb_width = round(width * scale)
+    thumb_height = round(height * scale)
+    decode_width = max(thumb_width, round(thumb_width * THUMBNAIL_DECODE_SCALE))
+    decode_height = max(thumb_height, round(thumb_height * THUMBNAIL_DECODE_SCALE))
+
+    def _render_with_reader(source_path, source_frame, inspect_reader):
+        reader = None
+        try:
+            reader = openshot.Clip.CreateReader(source_path, inspect_reader)
+            if not reader:
+                raise RuntimeError("No reader available for thumbnail generation")
+
+            if hasattr(reader, "SetMaxDecodeSize"):
+                reader.SetMaxDecodeSize(decode_width, decode_height)
+            reader.Open()
+
+            started = time.perf_counter()
+            frame = reader.GetFrame(source_frame)
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            frame.Thumbnail(
+                thumb_path,
+                thumb_width,
+                thumb_height,
+                mask,
+                overlay,
+                "#000",
+                False,
+                "png",
+                85,
+                0.0,
+                openshot.SCALE_CROP,
+            )
+            return {"frame_ms": elapsed_ms, "frame": source_frame,
+                    "decode_size": [decode_width, decode_height]}
+        finally:
+            if reader:
+                try:
+                    reader.Close()
+                except Exception:
+                    pass
+        # Return False only when an exception is handled in caller.
+
+    sources = [(file_path, thumbnail_frame)]
+    if proxy_source:
+        sources.insert(0, proxy_source)
+    for source_path, source_frame in sources:
+        for inspect_reader in (False, True):
+            try:
+                measurement = _render_with_reader(source_path, source_frame, inspect_reader)
+                if proxy_source and source_path == proxy_source[0]:
+                    measurement["is_proxy"] = True
+                return measurement
+            except RuntimeError:
+                # Retry with eager inspection, then fall back to the original source.
+                continue
+
+    # Any failure opening the reader (i.e. file missing or corrupt) use placeholder thumbnail
+    not_found_path = os.path.join(info.IMAGES_PATH, "NotFound.svg")
+    try:
+        _render_with_reader(not_found_path, 1, False)
+    except RuntimeError:
+        log.warning(f"Failed to generate placeholder thumbnail from: {not_found_path}", exc_info=1)
+    log.warning(f"Failed to generate thumbnail for missing file: {file_path}")
+
+
+def ThumbnailCacheIsStale(thumb_path):
+    """Return True when an on-disk thumbnail predates the current cache format."""
+    try:
+        return os.path.getmtime(thumb_path) < THUMBNAIL_CACHE_VERSION_TS
+    except OSError:
+        return True
+
+
+def FindCachedThumbnail(file_id, frame, fps=0.0):
+    """Find a current source thumbnail without requesting or decoding a frame."""
+    cache_id = ThumbnailCacheId(file_id)
+    frames = [int(frame)]
+    rounded = RoundFrameToThumbnailGrid(frame, fps)
+    if rounded != frame:
+        frames.append(rounded)
+    for cached_frame in frames:
+        legacy_name = ("%s.png" % cache_id if cached_frame == 1
+                       else "%s-%s.png" % (cache_id, cached_frame))
+        for path in (ThumbnailPathForFrame(file_id, cached_frame),
+                     os.path.join(info.THUMBNAIL_PATH, legacy_name)):
+            if os.path.isfile(path) and not ThumbnailCacheIsStale(path):
+                return path
+    return ""
 
 
 class httpThumbnailServer(ThreadingMixIn, HTTPServer):
     """ This class allows to handle requests in separated threads.
         No further content needed, don't touch this. """
+
+
+class httpThumbnailException(Exception):
+    """ Custom exception if server cannot start. This can happen if a port does ot allow a connection
+        due to another program or due to a firewall. """
 
 
 class httpThumbnailServerThread(Thread):
@@ -101,21 +382,39 @@ class httpThumbnailServerThread(Thread):
         self.thumbServer.shutdown()
 
     def run(self):
+        log.info("Starting thumbnail server listening on %s", self.server_address)
         self.running = True
-
-        # Start listening for HTTP requests (and check for shutdown every 0.5 seconds)
-        self.server_address = ('127.0.0.1', self.find_free_port())
-        self.thumbServer = httpThumbnailServer(self.server_address, httpThumbnailHandler)
-        self.thumbServer.daemon_threads = True
-        log.info(
-            "Starting thumbnail server listening on port %d",
-            self.server_address[1])
         self.thumbServer.serve_forever(0.5)
 
     def __init__(self):
+        """ Attempt to find an available port, and bind to that port for our thumbnail HTTP server.
+            If not able to bind to localhost or a specific port, return an exception (and quit OpenShot). """
         Thread.__init__(self)
         self.daemon = True
         self.server_address = None
+        self.running = False
+        self.thumbServer = None
+
+        exceptions = []
+        initial_port = self.find_free_port()
+        for attempt in range(3):
+            try:
+                # Configure server address and port for our HTTP thumbnail server
+                self.server_address = ('127.0.0.1', initial_port + attempt)
+                log.debug("Attempting to start thumbnail server listening on port %s", self.server_address)
+                self.thumbServer = httpThumbnailServer(self.server_address, httpThumbnailHandler)
+                self.thumbServer.daemon_threads = True
+                exceptions.clear()
+                break
+
+            except Exception as ex:
+                # Silently track each exception
+                # Return full list of exceptions (from each attempt, if no attempt is successful)
+                exceptions.append(f"{self.server_address} {ex}")
+
+        if exceptions:
+            # Return full list of attempts + exceptions if we failed to make a connection
+            raise httpThumbnailException("\n".join(exceptions))
 
 
 class httpThumbnailHandler(BaseHTTPRequestHandler):
@@ -127,7 +426,7 @@ class httpThumbnailHandler(BaseHTTPRequestHandler):
 
     def log_error(self, msg_format, *args):
         """ Log error from HTTPServer """
-        log.error(msg_format % args)
+        log.warning(msg_format % args)
 
     def do_GET(self):
         """ Process each GET request and return a value (image or file path)"""
@@ -152,9 +451,8 @@ class httpThumbnailHandler(BaseHTTPRequestHandler):
         only_path = url_output.group('only_path')
         no_cache = url_output.group('no_cache')
 
-        log.debug(
-            "Processing thumbnail request for %s frame %d",
-            file_id, file_frame)
+        controller = getattr(getattr(get_app(), "window", None), "auto_optimize", None)
+        epoch = controller.epoch if controller is not None else None
 
         try:
             # Look up file data
@@ -175,41 +473,55 @@ class httpThumbnailHandler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'text/html; charset=utf-8')
         self.end_headers()
 
-        # Locate thumbnail
-        thumb_path = os.path.join(info.THUMBNAIL_PATH, file_id, "%s.png" % file_frame)
-        if not os.path.exists(thumb_path) and file_frame == 1:
-            # Try ID with no frame # (for backwards compatibility)
-            thumb_path = os.path.join(info.THUMBNAIL_PATH, "%s.png" % file_id)
-        if not os.path.exists(thumb_path) and file_frame != 1:
-            # Try with ID and frame # in filename (for backwards compatibility)
-            thumb_path = os.path.join(info.THUMBNAIL_PATH, "%s-%s.png" % (file_id, file_frame))
+        if file.data.get("type") == "QtTextReader":
+            from classes.direct_text import render_text
+            thumb_path = render_text(file.data["direct_text"], info.THUMBNAIL_PATH, black_background=True)
+            if only_path:
+                self.wfile.write(thumb_path.encode("utf-8"))
+            else:
+                with open(thumb_path, "rb") as image:
+                    self.wfile.write(image.read())
+            return
 
-        if not os.path.exists(thumb_path) or no_cache:
+        # All entries sharing source media read/write the same cache folder.
+        fps_data = file.data.get("fps") or {}
+        fps = float(fps_data.get("num") or 0) / float(fps_data.get("den") or 1)
+        thumb_path = "" if no_cache else FindCachedThumbnail(file_id, file_frame, fps)
+        if not thumb_path:
+            thumb_path = ThumbnailPathForFrame(file_id, file_frame)
+
+        if not os.path.exists(thumb_path) or no_cache or ThumbnailCacheIsStale(thumb_path):
             # Generate thumbnail (since we can't find it)
-
-            # Determine if video overlay should be applied to thumbnail
-            overlay_path = ""
-            if file.data["media_type"] == "video":
-                overlay_path = os.path.join(info.IMAGES_PATH, "overlay.png")
-
-            # Create thumbnail image
-            GenerateThumbnail(
+            thumb_width = info.LIST_ICON_SIZE.width()
+            thumb_height = info.LIST_ICON_SIZE.height()
+            fingerprint = source_fingerprint(file_path) if file_frame == 1 else None
+            measurement = GenerateThumbnail(
                 file_path,
                 thumb_path,
                 file_frame,
-                98, 64,
+                thumb_width,
+                thumb_height,
                 mask_path,
-                overlay_path)
+                "",
+                proxy_source=ThumbnailProxySource(file.data, file_frame))
+            # Only newly decoded first frames of source videos are performance samples.
+            # Cached PNGs and placeholder images never supply a measurement.
+            if (controller is not None and file_frame == 1 and isinstance(measurement, dict)
+                    and not measurement.get("is_proxy")
+                    and fingerprint is not None and file.data.get("media_type") == "video"
+                    and file.data.get("type") == "FFmpegReader"):
+                measurement.update(version=MEASUREMENT_VERSION, machine=machine_id(), source=fingerprint)
+                controller.thumbnail_measured.emit(epoch, file_id, measurement)
 
         # Send message back to client
         if os.path.exists(thumb_path):
-            if not only_path:
-                self.wfile.write(open(thumb_path, 'rb').read())
-            else:
+            if only_path:
                 self.wfile.write(bytes(thumb_path, "utf-8"))
+            else:
+                with open(thumb_path, 'rb') as f:
+                    self.wfile.write(f.read())
 
         # Pause processing of request (since we don't currently use thread pooling, this allows
         # the threads to be processed without choking the CPU as much
         # TODO: Make HTTPServer work with a limited thread pool and remove this sleep() hack.
         time.sleep(0.01)
-
